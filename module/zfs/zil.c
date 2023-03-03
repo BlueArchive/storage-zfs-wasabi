@@ -1139,6 +1139,17 @@ zil_lwb_flush_vdevs_done(zio_t *zio)
 
 	spa_config_exit(zilog->zl_spa, SCL_STATE, lwb);
 
+	if (zio->io_error) {
+		cmn_err(CE_WARN, "KLARA: zil_lwb_flush_vdevs_done io_error=%d",
+		    zio, zio->io_error);
+		if (!spa_suspended(zio->io_spa)) {
+			zio_suspend(zio->io_spa, zio, ZIO_SUSPEND_IOERR);
+		}
+		if (spa_get_failmode(zilog->zl_spa) == ZIO_FAILURE_MODE_WAIT) {
+			zio_resume_wait(zio->io_spa);
+		}
+	}
+
 	zio_buf_free(lwb->lwb_buf, lwb->lwb_sz);
 
 	mutex_enter(&zilog->zl_lock);
@@ -1280,6 +1291,8 @@ zil_lwb_write_done(zio_t *zio)
 	 * that function).
 	 */
 	if (zio->io_error != 0) {
+		cmn_err(CE_WARN, "KLARA: zil_lwb_write_done failed, io_error=%d",
+		    zio, zio->io_error);
 		while ((zv = avl_destroy_nodes(t, &cookie)) != NULL)
 			kmem_free(zv, sizeof (*zv));
 		return;
@@ -1317,7 +1330,10 @@ zil_lwb_write_done(zio_t *zio)
 			 * since these "zio_flush" errors will not be
 			 * propagated up to "zil_lwb_flush_vdevs_done".
 			 */
-			zio_flush(lwb->lwb_root_zio, vd);
+			zio_nowait(zio_ioctl(lwb->lwb_root_zio,
+			    lwb->lwb_root_zio->io_spa, vd,
+			    DKIOCFLUSHWRITECACHE, NULL, NULL,
+			    ZIO_FLAG_CANFAIL | ZIO_FLAG_DONT_RETRY));
 		}
 		kmem_free(zv, sizeof (*zv));
 	}
@@ -2682,7 +2698,7 @@ out:
  * For more details, see zil_process_commit_list(); more specifically,
  * the comment at the bottom of that function.
  */
-static void
+static int
 zil_commit_waiter(zilog_t *zilog, zil_commit_waiter_t *zcw)
 {
 	ASSERT(!MUTEX_HELD(&zilog->zl_lock));
@@ -2776,11 +2792,22 @@ zil_commit_waiter(zilog_t *zilog, zil_commit_waiter_t *zcw)
 			    lwb->lwb_state == LWB_STATE_ISSUED ||
 			    lwb->lwb_state == LWB_STATE_WRITE_DONE ||
 			    lwb->lwb_state == LWB_STATE_FLUSH_DONE);
-			cv_wait(&zcw->zcw_cv, &zcw->zcw_lock);
+
+			/* Add a timeout here so we can abort if suspended */
+			int rc = cv_timedwait_hires(&zcw->zcw_cv,
+                            &zcw->zcw_lock, gethrtime() + USEC2NSEC(100),
+                            USEC2NSEC(1), CALLOUT_FLAG_ABSOLUTE);
+			if (rc == -1 && spa_suspended(zilog->zl_spa) &&
+			    spa_get_failmode(zilog->zl_spa) ==
+			    ZIO_FAILURE_MODE_CONTINUE) {
+				mutex_exit(&zcw->zcw_lock);
+				return (EIO);
+			}
 		}
 	}
 
 	mutex_exit(&zcw->zcw_lock);
+	return (0);
 }
 
 static zil_commit_waiter_t *
@@ -2945,9 +2972,11 @@ zil_commit_itx_assign(zilog_t *zilog, zil_commit_waiter_t *zcw)
  *      but the order in which they complete will be the same order in
  *      which they were created.
  */
-void
+int
 zil_commit(zilog_t *zilog, uint64_t foid)
 {
+	int err = 0;
+
 	/*
 	 * We should never attempt to call zil_commit on a snapshot for
 	 * a couple of reasons:
@@ -2964,7 +2993,7 @@ zil_commit(zilog_t *zilog, uint64_t foid)
 	ASSERT3B(dmu_objset_is_snapshot(zilog->zl_os), ==, B_FALSE);
 
 	if (zilog->zl_sync == ZFS_SYNC_DISABLED)
-		return;
+		return (0);
 
 	if (!spa_writeable(zilog->zl_spa)) {
 		/*
@@ -2978,7 +3007,16 @@ zil_commit(zilog_t *zilog, uint64_t foid)
 		ASSERT3P(zilog->zl_last_lwb_opened, ==, NULL);
 		for (int i = 0; i < TXG_SIZE; i++)
 			ASSERT3P(zilog->zl_itxg[i].itxg_itxs, ==, NULL);
-		return;
+		return (SET_ERROR(EROFS));
+	}
+
+	/*
+	 * If the SPA is suspended, and failmode=continue, we should
+	 * fail any new commits.
+	 */
+	if (spa_suspended(zilog->zl_spa) &&
+	    spa_get_failmode(zilog->zl_spa) == ZIO_FAILURE_MODE_CONTINUE) {
+		return (SET_ERROR(EIO));
 	}
 
 	/*
@@ -2990,15 +3028,20 @@ zil_commit(zilog_t *zilog, uint64_t foid)
 	 */
 	if (zilog->zl_suspend > 0) {
 		txg_wait_synced(zilog->zl_dmu_pool, 0);
-		return;
+		return (0);
 	}
 
-	zil_commit_impl(zilog, foid);
+	err = zil_commit_impl(zilog, foid);
+
+	return (err);
 }
 
-void
+int
 zil_commit_impl(zilog_t *zilog, uint64_t foid)
 {
+	int err = 0;
+	int rc = 0;
+
 	ZIL_STAT_BUMP(zil_commit_count);
 
 	/*
@@ -3031,9 +3074,33 @@ zil_commit_impl(zilog_t *zilog, uint64_t foid)
 	zil_commit_itx_assign(zilog, zcw);
 
 	zil_commit_writer(zilog, zcw);
-	zil_commit_waiter(zilog, zcw);
+	rc = zil_commit_waiter(zilog, zcw);
 
-	if (zcw->zcw_zio_error != 0) {
+	if (rc != 0 || zcw->zcw_zio_error != 0) {
+		/*
+		 * If the SPA is suspended, and failmode=continue, we should
+		 * fail any new commits.
+		 */
+		if (spa_suspended(zilog->zl_spa) &&
+		    spa_get_failmode(zilog->zl_spa) ==
+		    ZIO_FAILURE_MODE_CONTINUE) {
+			cmn_err(CE_WARN, "KLARA: zil_commit_impl() error=%d "
+			    "suspended=%d failmode=%lld\n", zcw->zcw_zio_error,
+			    spa_suspended(zilog->zl_spa),
+			    spa_get_failmode(zilog->zl_spa));
+			err = SET_ERROR(EIO);
+			goto skipwait;
+		} else if ((zcw->zcw_zio_error == EIO ||
+		    zcw->zcw_zio_error == ENXIO) &&
+		    spa_get_failmode(zilog->zl_spa) ==
+		    ZIO_FAILURE_MODE_CONTINUE) {
+			cmn_err(CE_WARN, "KLARA: zil_commit_impl() error=%d "
+			    "suspended=%d failmode=%lld\n", zcw->zcw_zio_error,
+			    spa_suspended(zilog->zl_spa),
+			    spa_get_failmode(zilog->zl_spa));
+			err = SET_ERROR(zcw->zcw_zio_error);
+			goto skipwait;
+		}
 		/*
 		 * If there was an error writing out the ZIL blocks that
 		 * this thread is waiting on, then we fallback to
@@ -3044,10 +3111,19 @@ zil_commit_impl(zilog_t *zilog, uint64_t foid)
 		 */
 		DTRACE_PROBE2(zil__commit__io__error,
 		    zilog_t *, zilog, zil_commit_waiter_t *, zcw);
-		txg_wait_synced(zilog->zl_dmu_pool, 0);
+		cmn_err(CE_WARN, "KLARA: zil_commit_impl() error=%d falling "
+		    "back to txg_wait_synced()\n", zcw->zcw_zio_error);
+		while ((err = txg_wait_synced_sig(zilog->zl_dmu_pool, 0))
+		    != 0) {
+			cmn_err(CE_WARN, "KLARA: zil_commit_impl() "
+			    "txg_wait_synced_impl() aborted, retrying...");
+		}
 	}
 
+skipwait:
 	zil_free_commit_waiter(zcw);
+
+	return (err);
 }
 
 /*

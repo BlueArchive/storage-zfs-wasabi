@@ -4181,7 +4181,7 @@ vdev_clear(spa_t *spa, vdev_t *vd)
 	/*
 	 * It makes no sense to "clear" an indirect  or removed vdev.
 	 */
-	if (!vdev_is_concrete(vd) || vd->vdev_removed)
+	if (!vdev_is_concrete(vd))
 		return;
 
 	/*
@@ -4191,7 +4191,7 @@ vdev_clear(spa_t *spa, vdev_t *vd)
 	 * written out to disk.
 	 */
 	if (vd->vdev_faulted || vd->vdev_degraded ||
-	    !vdev_readable(vd) || !vdev_writeable(vd)) {
+	    !vdev_readable(vd) || !vdev_writeable(vd) || vd->vdev_removed) {
 		/*
 		 * When reopening in response to a clear event, it may be due to
 		 * a fmadm repair request.  In this case, if the device is
@@ -4202,6 +4202,8 @@ vdev_clear(spa_t *spa, vdev_t *vd)
 		vd->vdev_faulted = vd->vdev_degraded = 0ULL;
 		vd->vdev_cant_read = B_FALSE;
 		vd->vdev_cant_write = B_FALSE;
+		vd->vdev_remove_wanted = B_FALSE;
+		vd->vdev_removed = B_FALSE;
 		vd->vdev_stat.vs_aux = 0;
 
 		vdev_reopen(vd == rvd ? rvd : vd->vdev_top);

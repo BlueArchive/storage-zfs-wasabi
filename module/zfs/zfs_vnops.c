@@ -61,6 +61,7 @@ static ulong_t zfs_fsync_sync_cnt = 4;
 int
 zfs_fsync(znode_t *zp, int syncflag, cred_t *cr)
 {
+	int error = 0;
 	zfsvfs_t *zfsvfs = ZTOZSB(zp);
 
 	(void) tsd_set(zfs_fsyncer_key, (void *)zfs_fsync_sync_cnt);
@@ -68,12 +69,12 @@ zfs_fsync(znode_t *zp, int syncflag, cred_t *cr)
 	if (zfsvfs->z_os->os_sync != ZFS_SYNC_DISABLED) {
 		ZFS_ENTER(zfsvfs);
 		ZFS_VERIFY_ZP(zp);
-		zil_commit(zfsvfs->z_log, zp->z_id);
+		error = zil_commit(zfsvfs->z_log, zp->z_id);
 		ZFS_EXIT(zfsvfs);
 	}
 	tsd_set(zfs_fsyncer_key, NULL);
 
-	return (0);
+	return (error);
 }
 
 
