@@ -260,6 +260,7 @@ zfs_is_readonly(zfsvfs_t *zfsvfs)
 int
 zfs_sync(struct super_block *sb, int wait, cred_t *cr)
 {
+    int error = 0;
 	zfsvfs_t *zfsvfs = sb->s_fs_info;
 
 	/*
