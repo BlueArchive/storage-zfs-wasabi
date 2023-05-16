@@ -61,19 +61,24 @@ static ulong_t zfs_fsync_sync_cnt = 4;
 int
 zfs_fsync(znode_t *zp, int syncflag, cred_t *cr)
 {
+	int err = 0;
 	zfsvfs_t *zfsvfs = ZTOZSB(zp);
+
+	if (zfsvfs->z_os->os_sync == ZFS_SYNC_DISABLED)
+		return (0);
+
+	ZFS_ENTER_UNMOUNTOK(zfsvfs);
+	ZFS_VERIFY_ZP(zp);
 
 	(void) tsd_set(zfs_fsyncer_key, (void *)zfs_fsync_sync_cnt);
 
-	if (zfsvfs->z_os->os_sync != ZFS_SYNC_DISABLED) {
-		ZFS_ENTER(zfsvfs);
-		ZFS_VERIFY_ZP(zp);
-		zil_commit(zfsvfs->z_log, zp->z_id);
-		ZFS_EXIT(zfsvfs);
-	}
+	err = zil_commit(zfsvfs->z_log, zp->z_id);
+
 	tsd_set(zfs_fsyncer_key, NULL);
 
-	return (0);
+	ZFS_EXIT(zfsvfs);
+
+	return (err);
 }
 
 
@@ -552,7 +557,8 @@ zfs_write(znode_t *zp, zfs_uio_t *uio, int ioflag, cred_t *cr)
 		    MIN(n, max_blksz));
 		DB_DNODE_EXIT(db);
 		zfs_sa_upgrade_txholds(tx, zp);
-		error = dmu_tx_assign(tx, TXG_WAIT);
+		error = dmu_tx_assign(tx,
+		    DMU_TX_ASSIGN_WAIT | DMU_TX_ASSIGN_CONTINUE);
 		if (error) {
 			dmu_tx_abort(tx);
 			if (abuf != NULL)

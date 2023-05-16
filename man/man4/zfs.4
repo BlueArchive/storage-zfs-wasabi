@@ -15,7 +15,7 @@
 .\" own identifying information:
 .\" Portions Copyright [yyyy] [name of copyright owner]
 .\"
-.Dd June 1, 2021
+.Dd January 10, 2023
 .Dt ZFS 4
 .Os
 .
@@ -227,6 +227,12 @@ relative to the pool.
 .It Sy metaslab_force_ganging Ns = Ns Sy 16777217 Ns B Ns B Po 16MB + 1B Pc Pq ulong
 Make some blocks above a certain size be gang blocks.
 This option is used by the test suite to facilitate testing.
+.
+.It Sy zfs_default_bs Ns = Ns Sy 9 Po 512 B Pc Pq int
+Default dnode block size as a power of 2.
+.
+.It Sy zfs_default_ibs Ns = Ns Sy 17 Po 128 KiB Pc Pq int
+Default dnode indirect block size as a power of 2.
 .
 .It Sy zfs_history_output_max Ns = Ns Sy 1048576 Ns B Ns B Po 1MB Pc Pq int
 When attempting to log an output nvlist of an ioctl in the on-disk history,
@@ -471,6 +477,10 @@ If set, when we start iterating over a ZAP object,
 prefetch the entire object (all leaf blocks).
 However, this is limited by
 .Sy dmu_prefetch_max .
+.
+.It Sy zap_micro_max_size Ns = Ns Sy 131072 Ns B Po 128 KiB Pc Pq int
+Maximum micro ZAP size.
+A micro ZAP is upgraded to a fat ZAP, once it grows beyond the specified size.
 .
 .It Sy zfetch_array_rd_sz Ns = Ns Sy 1048576 Ns B Po 1MB Pc Pq ulong
 If prefetching is enabled, disable prefetching for reads larger than this size.
@@ -940,6 +950,18 @@ Disables requirement for IVset GUIDs to be present and match when doing a raw
 receive of encrypted datasets.
 Intended for users whose pools were created with
 OpenZFS pre-release versions and now have compatibility issues.
+.
+.It Sy zfs_forced_export_unmount Ns = Ns Sy 0 Ns | Ns 1 Pq int
+During forced unmount, leave the filesystem in a disabled mode of operation,
+in which all new I/Os fail, except for those required to unmount it.
+Intended for users trying to forcibly export a pool even when I/Os are in
+progress, without the need to find and stop them.
+This option does not affect processes that are merely sitting on the
+filesystem, only those performing active I/O.
+.Pp
+This parameter can be set to 1 to enable this behavior.
+.Pp
+This parameter only applies on Linux.
 .
 .It Sy zfs_key_max_salt_uses Ns = Ns Sy 400000000 Po 4*10^8 Pc Pq ulong
 Maximum number of uses of a single salt value before generating a new one for

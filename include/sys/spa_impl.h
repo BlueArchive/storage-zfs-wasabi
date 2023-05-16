@@ -244,6 +244,8 @@ struct spa {
 	kmutex_t	spa_evicting_os_lock;	/* Evicting objset list lock */
 	list_t		spa_evicting_os_list;	/* Objsets being evicted. */
 	kcondvar_t	spa_evicting_os_cv;	/* Objset Eviction Completion */
+	kthread_t	*spa_export_initiator;	/* thread exporting the pool */
+	boolean_t	spa_pre_exporting;	/* allow fails before export */
 	txg_list_t	spa_vdev_txg_list;	/* per-txg dirty vdev list */
 	vdev_t		*spa_root_vdev;		/* top-level vdev container */
 	uint64_t	spa_min_ashift;		/* of vdevs in normal class */
@@ -406,6 +408,7 @@ struct spa {
 	uint64_t	spa_autotrim;		/* automatic background trim? */
 	uint64_t	spa_errata;		/* errata issues detected */
 	spa_stats_t	spa_stats;		/* assorted spa statistics */
+	json_stats_t	spa_json_stats;		/* json stats */
 	spa_keystore_t	spa_keystore;		/* loaded crypto keys */
 
 	/* arc_memory_throttle() parameters during low memory condition */

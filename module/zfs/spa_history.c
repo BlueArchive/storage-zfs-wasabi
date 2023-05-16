@@ -385,7 +385,7 @@ spa_history_log_nvl(spa_t *spa, nvlist_t *nvl)
 	}
 
 	tx = dmu_tx_create_dd(spa_get_dsl(spa)->dp_mos_dir);
-	err = dmu_tx_assign(tx, TXG_WAIT);
+	err = dmu_tx_assign(tx, DMU_TX_ASSIGN_WAIT | DMU_TX_ASSIGN_NOSUSPEND);
 	if (err) {
 		dmu_tx_abort(tx);
 		return (err);
@@ -521,9 +521,10 @@ log_internal(nvlist_t *nvl, const char *operation, spa_t *spa,
 	/*
 	 * If this is part of creating a pool, not everything is
 	 * initialized yet, so don't bother logging the internal events.
-	 * Likewise if the pool is not writeable.
+	 * Likewise if the pool is not writeable, or is being force exported.
 	 */
-	if (spa_is_initializing(spa) || !spa_writeable(spa)) {
+	if (spa_is_initializing(spa) || !spa_writeable(spa) ||
+	    spa_exiting_any(spa)) {
 		fnvlist_free(nvl);
 		return;
 	}
@@ -555,7 +556,7 @@ spa_history_log_internal(spa_t *spa, const char *operation,
 	/* create a tx if we didn't get one */
 	if (tx == NULL) {
 		htx = dmu_tx_create_dd(spa_get_dsl(spa)->dp_mos_dir);
-		if (dmu_tx_assign(htx, TXG_WAIT) != 0) {
+		if (dmu_tx_assign(htx, DMU_TX_ASSIGN_WAIT) != 0) {
 			dmu_tx_abort(htx);
 			return;
 		}

@@ -460,6 +460,7 @@ dmu_tx_hold_zap_impl(dmu_tx_hold_t *txh, const char *name)
 	dmu_tx_t *tx = txh->txh_tx;
 	dnode_t *dn = txh->txh_dnode;
 	int err;
+	extern int zap_micro_max_size;
 
 	ASSERT(tx->tx_txg == 0);
 
@@ -475,7 +476,7 @@ dmu_tx_hold_zap_impl(dmu_tx_hold_t *txh, const char *name)
 	 *    - 2 grown ptrtbl blocks
 	 */
 	(void) zfs_refcount_add_many(&txh->txh_space_towrite,
-	    MZAP_MAX_BLKSZ, FTAG);
+	    zap_micro_max_size, FTAG);
 
 	if (dn == NULL)
 		return;
@@ -854,7 +855,7 @@ dmu_tx_delay(dmu_tx_t *tx, uint64_t dirty)
  * decreasing performance.
  */
 static int
-dmu_tx_try_assign(dmu_tx_t *tx, uint64_t txg_how)
+dmu_tx_try_assign(dmu_tx_t *tx, dmu_tx_assign_flag_t flags)
 {
 	spa_t *spa = tx->tx_pool->dp_spa;
 
@@ -868,20 +869,46 @@ dmu_tx_try_assign(dmu_tx_t *tx, uint64_t txg_how)
 	if (spa_suspended(spa)) {
 		DMU_TX_STAT_BUMP(dmu_tx_suspended);
 
+		if (flags & DMU_TX_ASSIGN_NOSUSPEND)
+			return (SET_ERROR(EAGAIN));
+
+		/*
+		 * If the user is forcibly exporting the pool or the objset,
+		 * indicate to the caller that they need to give up.
+		 */
+		if (spa_exiting_any(spa))
+			return (SET_ERROR(EIO));
+
+		if (tx->tx_objset != NULL && dmu_objset_exiting(tx->tx_objset))
+			return (SET_ERROR(EIO));
+
 		/*
 		 * If the user has indicated a blocking failure mode
 		 * then return ERESTART which will block in dmu_tx_wait().
-		 * Otherwise, return EIO so that an error can get
-		 * propagated back to the VOP calls.
-		 *
-		 * Note that we always honor the txg_how flag regardless
-		 * of the failuremode setting.
 		 */
-		if (spa_get_failmode(spa) == ZIO_FAILURE_MODE_CONTINUE &&
-		    !(txg_how & TXG_WAIT))
+		if (spa_get_failmode(spa) != ZIO_FAILURE_MODE_CONTINUE)
+			return (SET_ERROR(ERESTART));
+
+		/*
+		 * If failmode=continue and we got here through some syscall,
+		 * then return EIO so it can be propagated back to the caller.
+		 */
+		if (flags & DMU_TX_ASSIGN_CONTINUE)
 			return (SET_ERROR(EIO));
 
-		return (SET_ERROR(ERESTART));
+		/*
+		 * If DMU_TX_ASSIGN_WAIT is set, always honor it. Non-syscall
+		 * ops (ZFS internals) that haven't opted out are expecting
+		 * dmu_tx_assign to block, regardless of failmode.
+		 */
+		if (flags & DMU_TX_ASSIGN_WAIT)
+			return (SET_ERROR(ERESTART));
+
+		/*
+		 * Anything else is requesting we don't wait, and doesn't care
+		 * about suspend state, so just return a general failure.
+		 */
+		return (SET_ERROR(EIO));
 	}
 
 	if (!tx->tx_dirty_delayed &&
@@ -994,25 +1021,38 @@ dmu_tx_unassign(dmu_tx_t *tx)
 	tx->tx_txg = 0;
 }
 
+static void dmu_tx_wait_flags(dmu_tx_t *, txg_wait_flag_t);
+
 /*
- * Assign tx to a transaction group; txg_how is a bitmask:
+ * Assign tx to a transaction group; "flags" is a bitmask:
  *
- * If TXG_WAIT is set and the currently open txg is full, this function
- * will wait until there's a new txg. This should be used when no locks
- * are being held. With this bit set, this function will only fail if
+ * If DMU_TX_ASSIGN_WAIT is set and the currently open txg is full, this
+ * function will wait until there's a new txg. This should be used when no
+ * locks are being held. With this bit set, this function will only fail if
  * we're truly out of space (or over quota).
  *
- * If TXG_WAIT is *not* set and we can't assign into the currently open
- * txg without blocking, this function will return immediately with
- * ERESTART. This should be used whenever locks are being held.  On an
- * ERESTART error, the caller should drop all locks, call dmu_tx_wait(),
- * and try again.
+ * If DMU_TX_ASSIGN_WAIT is *not* set and we can't assign into the currently
+ * open txg without blocking, this function will return immediately with
+ * ERESTART. This should be used whenever locks are being held.  On an ERESTART
+ * error, the caller should drop all locks, call dmu_tx_wait(), and try again.
  *
- * If TXG_NOTHROTTLE is set, this indicates that this tx should not be
+ * If DMU_TX_ASSIGN_NOTHROTTLE is set, this indicates that this tx should not be
  * delayed due on the ZFS Write Throttle (see comments in dsl_pool.c for
  * details on the throttle). This is used by the VFS operations, after
  * they have already called dmu_tx_wait() (though most likely on a
  * different tx).
+ *
+ * If DMU_TX_ASSIGN_NOSUSPEND is set, this indicates that this request must
+ * return EAGAIN if the pool becomes suspended while it is in progress.  This
+ * ensures that the request does not inadvertently cause conditions that cannot
+ * be unwound.
+ *
+ * If DMU_TX_ASSIGN_CONTINUE is set, the request will return EIO if
+ * failmode=continue and the pool becomes suspended while the request is in
+ * progress. For any other failmode, it is ignored. This is meant as a variant
+ * of NOSUSPEND for in syscalls and other places where it its possible to
+ * propagate a failure back at the earliest opportunity, and the operator has
+ * requested that we do so.
  *
  * It is guaranteed that subsequent successful calls to dmu_tx_assign()
  * will assign the tx to monotonically increasing txgs. Of course this is
@@ -1031,27 +1071,43 @@ dmu_tx_unassign(dmu_tx_t *tx)
  *     1 <- dmu_tx_get_txg(T3)
  */
 int
-dmu_tx_assign(dmu_tx_t *tx, uint64_t txg_how)
+dmu_tx_assign(dmu_tx_t *tx, dmu_tx_assign_flag_t flags)
 {
+	spa_t *spa = tx->tx_pool->dp_spa;
 	int err;
 
 	ASSERT(tx->tx_txg == 0);
-	ASSERT0(txg_how & ~(TXG_WAIT | TXG_NOTHROTTLE));
+	ASSERT0(flags & ~(DMU_TX_ASSIGN_WAIT | DMU_TX_ASSIGN_NOTHROTTLE |
+	    DMU_TX_ASSIGN_NOSUSPEND | DMU_TX_ASSIGN_CONTINUE));
 	ASSERT(!dsl_pool_sync_context(tx->tx_pool));
 
 	/* If we might wait, we must not hold the config lock. */
-	IMPLY((txg_how & TXG_WAIT), !dsl_pool_config_held(tx->tx_pool));
+	IMPLY((flags & DMU_TX_ASSIGN_WAIT), !dsl_pool_config_held(tx->tx_pool));
 
-	if ((txg_how & TXG_NOTHROTTLE))
+	if ((flags & DMU_TX_ASSIGN_NOTHROTTLE))
 		tx->tx_dirty_delayed = B_TRUE;
 
-	while ((err = dmu_tx_try_assign(tx, txg_how)) != 0) {
+	boolean_t nosuspend = (flags & DMU_TX_ASSIGN_NOSUSPEND) ||
+	    ((flags & DMU_TX_ASSIGN_CONTINUE) &&
+	    spa_get_failmode(spa) == ZIO_FAILURE_MODE_CONTINUE);
+
+	while ((err = dmu_tx_try_assign(tx, flags)) != 0) {
 		dmu_tx_unassign(tx);
 
-		if (err != ERESTART || !(txg_how & TXG_WAIT))
+		if (err != ERESTART || !(flags & DMU_TX_ASSIGN_WAIT))
 			return (err);
 
-		dmu_tx_wait(tx);
+		/*
+		 * Wait until there's room in this txg, or until its been
+		 * synced out and a new one is available.
+		 *
+		 * The caller may request that we abort if the pool suspends;
+		 * if so, we pass the NOSUSPEND flag down.  If the pool
+		 * suspends while we're waiting for the txg, this will return
+		 * and we'll loop and end up back in dmu_tx_try_assign, which
+		 * will deal with the suspension appropriately.
+		 */
+		dmu_tx_wait_flags(tx, nosuspend ? TXG_WAIT_F_NOSUSPEND : 0);
 	}
 
 	txg_rele_to_quiesce(&tx->tx_txgh);
@@ -1059,8 +1115,8 @@ dmu_tx_assign(dmu_tx_t *tx, uint64_t txg_how)
 	return (0);
 }
 
-void
-dmu_tx_wait(dmu_tx_t *tx)
+static void
+dmu_tx_wait_flags(dmu_tx_t *tx, txg_wait_flag_t flags)
 {
 	spa_t *spa = tx->tx_pool->dp_spa;
 	dsl_pool_t *dp = tx->tx_pool;
@@ -1105,8 +1161,11 @@ dmu_tx_wait(dmu_tx_t *tx)
 		 * has become active after this thread has tried to
 		 * obtain a tx.  If that's the case then tx_lasttried_txg
 		 * would not have been set.
+		 *
+		 * It's also possible the pool will be force exported, in
+		 * which case we'll try again and notice this fact, and exit.
 		 */
-		txg_wait_synced(dp, spa_last_synced_txg(spa) + 1);
+		txg_wait_synced_tx(dp, spa_last_synced_txg(spa) + 1, tx, flags);
 	} else if (tx->tx_needassign_txh) {
 		dnode_t *dn = tx->tx_needassign_txh->txh_dnode;
 
@@ -1120,11 +1179,32 @@ dmu_tx_wait(dmu_tx_t *tx)
 		 * If we have a lot of dirty data just wait until we sync
 		 * out a TXG at which point we'll hopefully have synced
 		 * a portion of the changes.
+		 *
+		 * It's also possible the pool will be force exported, in
+		 * which case we'll try again and notice this fact, and exit.
 		 */
-		txg_wait_synced(dp, spa_last_synced_txg(spa) + 1);
+		txg_wait_synced_tx(dp, spa_last_synced_txg(spa) + 1, tx, flags);
 	}
 
 	spa_tx_assign_add_nsecs(spa, gethrtime() - before);
+}
+
+void
+dmu_tx_wait(dmu_tx_t *tx)
+{
+	/*
+	 * If we're in a non-blocking failmode, we call dmu_tx_wait_flags() with
+	 * NOSUSPEND to ensure that if we end up in txg_wait_synced_tx(), we
+	 * don't we don't get stuck there.
+	 *
+	 * If the pool does suspend and we're in failmode=continue, the caller
+	 * will call dmu_tx_abort() and then try again. Eventually, it'll land
+	 * back in dmu_tx_assign(NOWAIT), which will return EIO, and the caller
+	 * will enter its error path.
+	 */
+	(void) dmu_tx_wait_flags(tx,
+	    (spa_get_failmode(tx->tx_pool->dp_spa) == ZIO_FAILURE_MODE_CONTINUE)
+	    ? TXG_WAIT_F_NOSUSPEND : 0);
 }
 
 static void

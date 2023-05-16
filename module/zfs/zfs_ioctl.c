@@ -221,6 +221,9 @@
 #include <sys/lua/lauxlib.h>
 #include <sys/zfs_ioctl_impl.h>
 
+
+int fmgw_debug = 0;
+
 kmutex_t zfsdev_state_lock;
 zfsdev_state_t *zfsdev_state_list;
 
@@ -1580,7 +1583,9 @@ zfs_ioc_pool_export(zfs_cmd_t *zc)
 	boolean_t force = (boolean_t)zc->zc_cookie;
 	boolean_t hardforce = (boolean_t)zc->zc_guid;
 
-	zfs_log_history(zc);
+	if (!force && !hardforce)
+		zfs_log_history(zc);
+
 	error = spa_export(zc->zc_name, NULL, force, hardforce);
 
 	return (error);
@@ -1592,6 +1597,8 @@ zfs_ioc_pool_configs(zfs_cmd_t *zc)
 	nvlist_t *configs;
 	int error;
 
+	if (fmgw_debug != 0)
+	    zfs_dbgmsg("fmgw -- calling spa_all_configs, which takes spa_namespace_lock");
 	if ((configs = spa_all_configs(&zc->zc_cookie)) == NULL)
 		return (SET_ERROR(EEXIST));
 
@@ -1618,6 +1625,8 @@ zfs_ioc_pool_stats(zfs_cmd_t *zc)
 	int error;
 	int ret = 0;
 
+	if (fmgw_debug != 0)
+		zfs_dbgmsg("fmgw -- calling spa_get_stats");
 	error = spa_get_stats(zc->zc_name, &config, zc->zc_value,
 	    sizeof (zc->zc_value));
 
@@ -1685,7 +1694,7 @@ zfs_ioc_pool_scan(zfs_cmd_t *zc)
 
 	if (zc->zc_flags == POOL_SCRUB_PAUSE)
 		error = spa_scrub_pause_resume(spa, POOL_SCRUB_PAUSE);
-	else if (zc->zc_cookie == POOL_SCAN_NONE)
+else if (zc->zc_cookie == POOL_SCAN_NONE)
 		error = spa_scan_stop(spa);
 	else
 		error = spa_scan(spa, zc->zc_cookie);
@@ -2087,6 +2096,8 @@ zfs_ioc_objset_stats(zfs_cmd_t *zc)
 	objset_t *os;
 	int error;
 
+	if (fmgw_debug != 0)
+		zfs_dbgmsg("fmgw");
 	error = dmu_objset_hold(zc->zc_name, FTAG, &os);
 	if (error == 0) {
 		error = zfs_ioc_objset_stats_impl(zc, os);
@@ -2214,6 +2225,8 @@ zfs_ioc_dataset_list_next(zfs_cmd_t *zc)
 	char *p;
 	size_t orig_len = strlen(zc->zc_name);
 
+	if (fmgw_debug != 0)
+		zfs_dbgmsg("fmgw");
 top:
 	if ((error = dmu_objset_hold(zc->zc_name, FTAG, &os))) {
 		if (error == ENOENT)
@@ -2957,6 +2970,8 @@ zfs_ioc_pool_get_props(zfs_cmd_t *zc)
 	int error;
 	nvlist_t *nvp = NULL;
 
+	if (fmgw_debug != 0)
+		zfs_dbgmsg("fmgw");
 	if ((error = spa_open(zc->zc_name, &spa, FTAG)) != 0) {
 		/*
 		 * If the pool is faulted, there may be properties we can still
@@ -3515,6 +3530,8 @@ zfs_ioc_log_history(const char *unused, nvlist_t *innvl, nvlist_t *outnvl)
 	spa_t *spa;
 	int error;
 
+	if (fmgw_debug != 0)
+		zfs_dbgmsg("fmgw");
 	/*
 	 * The poolname in the ioctl is not set, we get it from the TSD,
 	 * which was set at the end of the last successful ioctl that allows
@@ -6884,7 +6901,7 @@ zfs_ioctl_register(const char *name, zfs_ioc_t ioc, zfs_ioc_func_t *func,
 	vec->zvec_nvl_key_count = num_keys;
 }
 
-static void
+void
 zfs_ioctl_register_pool(zfs_ioc_t ioc, zfs_ioc_legacy_func_t *func,
     zfs_secpolicy_func_t *secpolicy, boolean_t log_history,
     zfs_ioc_poolcheck_t pool_check)
@@ -7156,9 +7173,9 @@ zfs_ioctl_init(void)
 	 * does the logging of those commands.
 	 */
 	zfs_ioctl_register_pool(ZFS_IOC_POOL_DESTROY, zfs_ioc_pool_destroy,
-	    zfs_secpolicy_config, B_FALSE, POOL_CHECK_SUSPENDED);
+	    zfs_secpolicy_config, B_FALSE, POOL_CHECK_NONE);
 	zfs_ioctl_register_pool(ZFS_IOC_POOL_EXPORT, zfs_ioc_pool_export,
-	    zfs_secpolicy_config, B_FALSE, POOL_CHECK_SUSPENDED);
+	    zfs_secpolicy_config, B_FALSE, POOL_CHECK_NONE);
 
 	zfs_ioctl_register_pool(ZFS_IOC_POOL_STATS, zfs_ioc_pool_stats,
 	    zfs_secpolicy_read, B_FALSE, POOL_CHECK_NONE);
@@ -7166,10 +7183,10 @@ zfs_ioctl_init(void)
 	    zfs_secpolicy_read, B_FALSE, POOL_CHECK_NONE);
 
 	zfs_ioctl_register_pool(ZFS_IOC_ERROR_LOG, zfs_ioc_error_log,
-	    zfs_secpolicy_inject, B_FALSE, POOL_CHECK_SUSPENDED);
+	    zfs_secpolicy_inject, B_FALSE, POOL_CHECK_NONE);
 	zfs_ioctl_register_pool(ZFS_IOC_DSOBJ_TO_DSNAME,
 	    zfs_ioc_dsobj_to_dsname,
-	    zfs_secpolicy_diff, B_FALSE, POOL_CHECK_SUSPENDED);
+	    zfs_secpolicy_diff, B_FALSE, POOL_CHECK_NONE);
 	zfs_ioctl_register_pool(ZFS_IOC_POOL_GET_HISTORY,
 	    zfs_ioc_pool_get_history,
 	    zfs_secpolicy_config, B_FALSE, POOL_CHECK_SUSPENDED);
@@ -7458,6 +7475,8 @@ zfsdev_ioctl_common(uint_t vecnum, zfs_cmd_t *zc, int flag)
 	if (vec->zvec_func == NULL && vec->zvec_legacy_func == NULL)
 		return (SET_ERROR(ZFS_ERR_IOC_CMD_UNAVAIL));
 
+//	if (fmgw_debug != 0)
+//		zfs_dbgmsg("enter ioctl, %d %x %s", vecnum, vecnum, fmgw_zioctl(vecnum + ZFS_IOC_FIRST));
 	zc->zc_iflags = flag & FKIOCTL;
 	max_nvlist_src_size = zfs_max_nvlist_src_size_os();
 	if (zc->zc_nvlist_src_size > max_nvlist_src_size) {
