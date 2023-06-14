@@ -12,7 +12,14 @@
 #include <sys/json_stats.h>
 #include <sys/nvpair_impl.h>
 
-#define	JSON_STATUS_VERSION	4
+#define	JSON_STATUS_VERSION_MAJOR	1
+#define	JSON_STATUS_VERSION_MINOR	4
+
+#ifdef ZFS_DEBUG
+#define	ZFS_DEBUG_STR	" (DEBUG mode)"
+#else
+#define	ZFS_DEBUG_STR	""
+#endif
 
 void
 json_stats_destroy(spa_t *spa)
@@ -88,44 +95,37 @@ null_filter(jprint_t *jp, const char *name, data_type_t type, void *value)
 static void nvlist_to_json(nvlist_t *nvl, jprint_t *jp, nvj_filter_t f);
 
 /*
- * Convert source (src) to string -- up to 105 characters, so pass in 256
- * byte buffer (for future)
+ * Convert source (src) to string array.
  */
 static void
-source_to_string(uint64_t src, char *buf)
+source_to_string_array(jprint_t *jp, uint64_t src)
 {
-	buf[0] = '\0';
-	if (src & ZPROP_SRC_NONE) {
-		if (buf[0] != '\0')
-			strcat(buf, "|");
-		strcat(buf, "ZPROP_SRC_NONE");
-	}
-	if (src & ZPROP_SRC_DEFAULT) {
-		if (buf[0] != '\0')
-			strcat(buf, "|");
-		strcat(buf, "ZPROP_SRC_DEFAULT");
-	}
-	if (src & ZPROP_SRC_TEMPORARY) {
-		if (buf[0] != '\0')
-			strcat(buf, "|");
-		strcat(buf, "ZPROP_SRC_TEMPORARY");
-	}
-	if (src & ZPROP_SRC_INHERITED) {
-		if (buf[0] != '\0')
-			strcat(buf, "|");
-		strcat(buf, "ZPROP_SRC_INHERITED");
-	}
-	if (src & ZPROP_SRC_RECEIVED) {
-		if (buf[0] != '\0')
-			strcat(buf, "|");
-		strcat(buf, "ZPROP_SRC_RECEIVED");
-	}
+	jp_printf(jp, "source: [");
+	src &= ZPROP_SRC_ALL;
+	/*
+	 * -- none is "-" if "sudo zpool get all", we translate to the
+	 *    empty array.
+	 *
+	 * if (src & ZPROP_SRC_NONE)
+	 *	jp_printf(jp, "%s", "none");
+	 */
+	if (src & ZPROP_SRC_DEFAULT)
+		jp_printf(jp, "%s", "default");
+	if (src & ZPROP_SRC_TEMPORARY)
+		jp_printf(jp, "%s", "temporary");
+	if (src & ZPROP_SRC_LOCAL)
+		jp_printf(jp, "%s", "local");
+	if (src & ZPROP_SRC_INHERITED)
+		jp_printf(jp, "%s", "inherited");
+	if (src & ZPROP_SRC_RECEIVED)
+		jp_printf(jp, "%s", "received");
+	jp_printf(jp, "]");
 }
 
 /*
  * spa_props_filter replace source: with string. The way source is
- * defined it could be bitmap -- so generate the | sequence as
- * needed.
+ * defined it could be bitmap -- so generate a nested array of strings.
+ * this is an approach to this kind of display.
  */
 static boolean_t
 spa_props_filter(jprint_t *jp, const char *name, data_type_t type, void *value)
@@ -133,9 +133,7 @@ spa_props_filter(jprint_t *jp, const char *name, data_type_t type, void *value)
 	if ((strcmp(name, "source") == 0) &&
 	    (type == DATA_TYPE_UINT64)) {
 		uint64_t src = *(uint64_t *)value;
-		char buf[256];
-		source_to_string(src, buf);
-		jp_printf(jp, "source: %s", buf);
+		source_to_string_array(jp, src);
 		return (B_TRUE);
 	}
 	return (B_FALSE);
@@ -192,7 +190,7 @@ stats_filter(jprint_t *jp, const char *name, data_type_t type, void *value)
 }
 
 /*
- * This code is NOT hightly abstracted -- just some duplication, until I
+ * This code is NOT highly abstracted -- just some duplication, until I
  * actually understand what is needed.
  *
  * In avoiding early abstraction, we find the need for a "filter". Which
@@ -301,19 +299,37 @@ nvlist_to_json(nvlist_t *nvl, jprint_t *jp, nvj_filter_t f)
 }
 
 static const char *
-vdev_state_string(uint64_t n)
+vdev_state_string(vdev_t *v)
 {
-	const char *s;
-	switch (n) {
-	case VDEV_STATE_UNKNOWN:	s = "HEALTHY";    break;
-	case VDEV_STATE_CLOSED:		s = "CLOSED";	  break;
-	case VDEV_STATE_OFFLINE:	s = "OFFLINE";    break;
-	case VDEV_STATE_REMOVED:	s = "REMOVED";    break;
-	case VDEV_STATE_CANT_OPEN:	s = "CAN'T OPEN"; break;
-	case VDEV_STATE_FAULTED:	s = "FAULTED";    break;
-	case VDEV_STATE_DEGRADED:	s = "DEGRADED";   break;
-	case VDEV_STATE_HEALTHY:	s = "HEALTHY";    break;
-	default:			s = "?";
+	const char *s = "UNKNOWN";
+	switch (v->vdev_state) {
+	case VDEV_STATE_CLOSED:
+	case VDEV_STATE_OFFLINE:
+		s = "OFFLINE";
+		break;
+	case VDEV_STATE_REMOVED:
+		s = "REMOVED";
+		break;
+	case VDEV_STATE_CANT_OPEN:
+		if (v->vdev_stat.vs_aux == VDEV_AUX_CORRUPT_DATA ||
+		    v->vdev_stat.vs_aux == VDEV_AUX_BAD_LOG)
+			s = "FAULTED";
+		else if (v->vdev_stat.vs_aux == VDEV_AUX_SPLIT_POOL)
+			s = "SPLIT";
+		else
+			s = "UNAVAIL";
+		break;
+	case VDEV_STATE_FAULTED:
+		s = "FAULTED";
+		break;
+	case VDEV_STATE_DEGRADED:
+		s = "DEGRADED";
+		break;
+	case VDEV_STATE_HEALTHY:
+		s = "ONLINE";
+		break;
+	default:
+		s = "UNKNOWN";
 	}
 	return (s);
 }
@@ -353,7 +369,7 @@ vdev_to_json(vdev_t *v, pool_scan_stat_t *ps, jprint_t *jp)
 		if (v->vdev_enc_sysfs_path != NULL)
 			jp_printf(jp, "enc_sysfs_path: %s",
 			    v->vdev_enc_sysfs_path);
-		jp_printf(jp, "state: %s", vdev_state_string(v->vdev_state));
+		jp_printf(jp, "state: %s", vdev_state_string(v));
 		/*
 		 * Try for some of the extended status annotations that
 		 * zpool status provides.
@@ -476,7 +492,7 @@ pss_func_to_string(uint64_t n)
 		case POOL_SCAN_RESILVER:	s = "RESILVER";	break;
 		case POOL_SCAN_FUNCS:		s = "?";
 	}
-	return s;
+	return (s);
 }
 
 static const char *pss_state_to_string(uint64_t n)
@@ -489,7 +505,7 @@ static const char *pss_state_to_string(uint64_t n)
 		case DSS_CANCELED:	s = "CANCELED";	break;
 		case DSS_NUM_STATES:	s = "?";
 	}
-	return s;
+	return (s);
 }
 
 static int
@@ -534,7 +550,13 @@ json_data(char *buf, size_t size, void *data)
 	jp_open(&jp, buf, size);
 	jp_printf(&jp, "{");
 
-	jp_printf(&jp, "status_json_version: %d", JSON_STATUS_VERSION);
+	jp_printf(&jp, "status_json_version_major: %d",
+	    JSON_STATUS_VERSION_MAJOR);
+	jp_printf(&jp, "status_json_version_minor: %d",
+	    JSON_STATUS_VERSION_MINOR);
+	jp_printf(&jp, "zfs_module_version: %s",
+	    "v" ZFS_META_VERSION "-" ZFS_META_RELEASE ZFS_DEBUG_STR);
+ 
 	jp_printf(&jp, "scl_config_lock: %b", scl_config_lock != 0);
 	jp_printf(&jp, "scan_error: %d", ps_error);
 	jp_printf(&jp, "scan_stats: {");
