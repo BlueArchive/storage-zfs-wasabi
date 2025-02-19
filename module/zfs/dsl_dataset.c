@@ -84,6 +84,8 @@
 int zfs_max_recordsize = 1 * 1024 * 1024;
 int zfs_allow_redacted_dataset_mount = 0;
 
+int zfs_snapshot_history_enabled = 1;
+
 #define	SWITCH64(x, y) \
 	{ \
 		uint64_t __tmp = (x); \
@@ -1966,7 +1968,8 @@ dsl_dataset_snapshot_sync_impl(dsl_dataset_t *ds, const char *snapname,
 
 	dsl_dir_snap_cmtime_update(ds->ds_dir);
 
-	spa_history_log_internal_ds(ds->ds_prev, "snapshot", tx, " ");
+	if (zfs_snapshot_history_enabled)
+		spa_history_log_internal_ds(ds->ds_prev, "snapshot", tx, " ");
 }
 
 void
@@ -3851,6 +3854,15 @@ dsl_dataset_promote_sync(void *arg, dmu_tx_t *tx)
 
 	dsl_dir_rele(odd, FTAG);
 	promote_rele(ddpa, FTAG);
+
+	/*
+	 * Transfer common error blocks from old head to new head.
+	 */
+	if (spa_feature_is_enabled(dp->dp_spa, SPA_FEATURE_HEAD_ERRLOG)) {
+		uint64_t old_head = origin_head->ds_object;
+		uint64_t new_head = hds->ds_object;
+		spa_swap_errlog(dp->dp_spa, new_head, old_head, tx);
+	}
 }
 
 /*
@@ -5067,6 +5079,37 @@ dsl_dataset_activate_redaction(dsl_dataset_t *ds, uint64_t *redact_snaps,
 	ds->ds_feature[SPA_FEATURE_REDACTED_DATASETS] = ftuaa;
 }
 
+/*
+ * Find and return (in *oldest_dsobj) the oldest snapshot of the dsobj
+ * dataset whose birth time is >= min_txg.
+ */
+int
+dsl_dataset_oldest_snapshot(spa_t *spa, uint64_t head_ds, uint64_t min_txg,
+    uint64_t *oldest_dsobj)
+{
+	dsl_dataset_t *ds;
+	dsl_pool_t *dp = spa->spa_dsl_pool;
+
+	int error = dsl_dataset_hold_obj(dp, head_ds, FTAG, &ds);
+	if (error != 0)
+		return (error);
+
+	uint64_t prev_obj = dsl_dataset_phys(ds)->ds_prev_snap_obj;
+	uint64_t prev_obj_txg = dsl_dataset_phys(ds)->ds_prev_snap_txg;
+
+	while (prev_obj != 0 && min_txg < prev_obj_txg) {
+		dsl_dataset_rele(ds, FTAG);
+		if ((error = dsl_dataset_hold_obj(dp, prev_obj,
+		    FTAG, &ds)) != 0)
+			return (error);
+		prev_obj_txg = dsl_dataset_phys(ds)->ds_prev_snap_txg;
+		prev_obj = dsl_dataset_phys(ds)->ds_prev_snap_obj;
+	}
+	*oldest_dsobj = ds->ds_object;
+	dsl_dataset_rele(ds, FTAG);
+	return (0);
+}
+
 /* BEGIN CSTYLED */
 #if defined(_LP64)
 #define	RECORDSIZE_PERM ZMOD_RW
@@ -5080,6 +5123,9 @@ ZFS_MODULE_PARAM(zfs, zfs_, max_recordsize, INT, RECORDSIZE_PERM,
 ZFS_MODULE_PARAM(zfs, zfs_, allow_redacted_dataset_mount, INT, ZMOD_RW,
 	"Allow mounting of redacted datasets");
 /* END CSTYLED */
+
+ZFS_MODULE_PARAM(zfs, zfs_, snapshot_history_enabled, INT, ZMOD_RW,
+	"Include snapshot events in pool history/events");
 
 EXPORT_SYMBOL(dsl_dataset_hold);
 EXPORT_SYMBOL(dsl_dataset_hold_flags);

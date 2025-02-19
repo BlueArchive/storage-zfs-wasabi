@@ -692,7 +692,7 @@ static void
 dbuf_evict_one(void)
 {
 	int idx = multilist_get_random_index(&dbuf_caches[DB_DBUF_CACHE].cache);
-	multilist_sublist_t *mls = multilist_sublist_lock(
+	multilist_sublist_t *mls = multilist_sublist_lock_idx(
 	    &dbuf_caches[DB_DBUF_CACHE].cache, idx);
 
 	ASSERT(!MUTEX_HELD(&dbuf_evict_lock));
@@ -1523,7 +1523,8 @@ dbuf_read_impl(dmu_buf_impl_t *db, zio_t *zio, uint32_t flags,
 	 * If this is not true it indicates tampering and we report an error.
 	 */
 	if (db->db_objset->os_encrypted && !BP_USES_CRYPT(db->db_blkptr)) {
-		spa_log_error(db->db_objset->os_spa, &zb);
+		spa_log_error(db->db_objset->os_spa, &zb,
+		    &db->db_blkptr->blk_birth);
 		zfs_panic_recover("unencrypted block in encrypted "
 		    "object set %llu", dmu_objset_id(db->db_objset));
 		err = SET_ERROR(EIO);

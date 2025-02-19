@@ -459,6 +459,13 @@ If we have less than this amount of free space,
 most ZPL operations (e.g. write, create) will return
 .Sy ENOSPC .
 .
+.It Sy spa_upgrade_errlog_limit Ns = Ns Sy 0 Pq uint
+Limits the number of on-disk error log entries that will be converted to the
+new format when enabling the
+.Sy head_errlog
+feature.
+The default is to convert all log entries.
+.
 .It Sy vdev_removal_max_span Ns = Ns Sy 32768 Ns B Po 32kB Pc Pq int
 During top-level vdev removal, chunks of data are copied from the vdev
 which may include free space in order to trade bandwidth for IOPS.
@@ -1761,6 +1768,9 @@ stop resilvering when the pool is next imported.
 Scrubs are processed by the sync thread.
 While scrubbing, it will spend at least this much time
 working on a scrub between TXG flushes.
+.
+.It Sy zfs_scrub_error_blocks_per_txg Ns = Ns Sy 4096 Pq uint
+Error blocks to be scrubbed in one txg.
 .
 .It Sy zfs_scan_checkpoint_intval Ns = Ns Sy 7200 Ns s Po 2h Pc Pq int
 To preserve progress across reboots, the sequential scan algorithm periodically

@@ -355,6 +355,9 @@ spa_prop_get_config(spa_t *spa, nvlist_t **nvp)
 		spa_prop_add_list(*nvp, ZPOOL_PROP_HEALTH, NULL,
 		    rvd->vdev_state, src);
 
+		spa_prop_add_list(*nvp, ZPOOL_PROP_LAST_SCRUBBED_TXG, NULL,
+		    spa_get_last_scrubbed_txg(spa), src);
+
 		version = spa_version(spa);
 		if (version == zpool_prop_default_numeric(ZPOOL_PROP_VERSION)) {
 			spa_prop_add_list(*nvp, ZPOOL_PROP_VERSION, NULL,
@@ -4612,6 +4615,12 @@ spa_ld_get_props(spa_t *spa)
 	if (error != 0 && error != ENOENT)
 		return (spa_vdev_err(rvd, VDEV_AUX_CORRUPT_DATA, EIO));
 
+	/* Load the last scrubbed txg. */
+	error = spa_dir_prop(spa, DMU_POOL_LAST_SCRUBBED_TXG,
+	    &spa->spa_scrubbed_last_txg, B_FALSE);
+	if (error != 0 && error != ENOENT)
+		return (spa_vdev_err(rvd, VDEV_AUX_CORRUPT_DATA, EIO));
+
 	/*
 	 * Load the livelist deletion field. If a livelist is queued for
 	 * deletion, indicate that in the spa
@@ -6027,7 +6036,7 @@ spa_get_stats(const char *name, nvlist_t **config,
 
 			VERIFY(nvlist_add_uint64(*config,
 			    ZPOOL_CONFIG_ERRCOUNT,
-			    spa_get_errlog_size(spa)) == 0);
+			    spa_approx_errlog_size(spa)) == 0);
 
 			if (spa_suspended(spa)) {
 				VERIFY(nvlist_add_uint64(*config,
@@ -8715,11 +8724,19 @@ spa_scan_stop(spa_t *spa)
 	ASSERT(spa_config_held(spa, SCL_ALL, RW_WRITER) == 0);
 	if (dsl_scan_resilvering(spa->spa_dsl_pool))
 		return (SET_ERROR(EBUSY));
+
 	return (dsl_scan_cancel(spa->spa_dsl_pool));
 }
 
 int
 spa_scan(spa_t *spa, pool_scan_func_t func)
+{
+	return (spa_scan_range(spa, func, 0, 0));
+}
+
+int
+spa_scan_range(spa_t *spa, pool_scan_func_t func, uint64_t txgstart,
+    uint64_t txgend)
 {
 	ASSERT(spa_config_held(spa, SCL_ALL, RW_WRITER) == 0);
 
@@ -8728,6 +8745,9 @@ spa_scan(spa_t *spa, pool_scan_func_t func)
 
 	if (func == POOL_SCAN_RESILVER &&
 	    !spa_feature_is_enabled(spa, SPA_FEATURE_RESILVER_DEFER))
+		return (SET_ERROR(ENOTSUP));
+
+	if (func != POOL_SCAN_SCRUB && (txgstart != 0 || txgend != 0))
 		return (SET_ERROR(ENOTSUP));
 
 	/*
@@ -8740,7 +8760,11 @@ spa_scan(spa_t *spa, pool_scan_func_t func)
 		return (0);
 	}
 
-	return (dsl_scan(spa->spa_dsl_pool, func));
+	if (func == POOL_SCAN_ERRORSCRUB &&
+	    !spa_feature_is_enabled(spa, SPA_FEATURE_HEAD_ERRLOG))
+		return (SET_ERROR(ENOTSUP));
+
+	return (dsl_scan(spa->spa_dsl_pool, func, txgstart, txgend));
 }
 
 /*
@@ -9786,6 +9810,7 @@ spa_sync_iterate_to_convergence(spa_t *spa, dmu_tx_t *tx)
 
 		ddt_sync(spa, txg);
 		dsl_scan_sync(dp, tx);
+		dsl_errorscrub_sync(dp, tx);
 		svr_sync(spa, tx);
 		spa_sync_upgrades(spa, tx);
 
@@ -10633,6 +10658,7 @@ EXPORT_SYMBOL(spa_l2cache_drop);
 
 /* scanning */
 EXPORT_SYMBOL(spa_scan);
+EXPORT_SYMBOL(spa_scan_range);
 EXPORT_SYMBOL(spa_scan_stop);
 
 /* spa syncing */

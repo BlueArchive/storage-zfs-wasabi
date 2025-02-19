@@ -66,6 +66,7 @@ typedef struct spa_error_entry {
 	zbookmark_phys_t	se_bookmark;
 	char			*se_name;
 	avl_node_t		se_avl;
+	zbookmark_err_phys_t	se_zep;		/* not accounted in avl_find */
 } spa_error_entry_t;
 
 typedef struct spa_history_phys {
@@ -299,7 +300,12 @@ struct spa {
 	uint64_t	spa_scan_pass_scrub_spent_paused; /* total paused */
 	uint64_t	spa_scan_pass_exam;	/* examined bytes per pass */
 	uint64_t	spa_scan_pass_issued;	/* issued bytes per pass */
+	uint64_t	spa_scrubbed_last_txg;	/* last txg scrubbed */
 
+	/* error scrub pause time in milliseconds */
+	uint64_t	spa_scan_pass_errorscrub_pause;
+	/* total error scrub paused time in milliseconds */
+	uint64_t	spa_scan_pass_errorscrub_spent_paused;
 	/*
 	 * We are in the middle of a resilver, and another resilver
 	 * is needed once this one completes. This is set iff any

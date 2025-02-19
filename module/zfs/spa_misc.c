@@ -1573,6 +1573,34 @@ spa_generate_guid(spa_t *spa)
 	return (guid);
 }
 
+static boolean_t
+spa_load_guid_exists(uint64_t guid)
+{
+	avl_tree_t *t = &spa_namespace_avl;
+
+	ASSERT(MUTEX_HELD(&spa_namespace_lock));
+
+	for (spa_t *spa = avl_first(t); spa != NULL; spa = AVL_NEXT(t, spa)) {
+		if (spa_load_guid(spa) == guid)
+			return (B_TRUE);
+	}
+
+	return (arc_async_flush_guid_inuse(guid));
+}
+
+uint64_t
+spa_generate_load_guid(void)
+{
+	uint64_t guid;
+
+	do {
+		(void) random_get_pseudo_bytes((void *)&guid,
+		    sizeof (guid));
+	} while (guid == 0 || spa_load_guid_exists(guid));
+
+	return (guid);
+}
+
 void
 snprintf_blkptr(char *buf, size_t buflen, const blkptr_t *bp)
 {
@@ -2676,6 +2704,12 @@ spa_mode(spa_t *spa)
 }
 
 uint64_t
+spa_get_last_scrubbed_txg(spa_t *spa)
+{
+	return (spa->spa_scrubbed_last_txg);
+}
+
+uint64_t
 spa_bootfs(spa_t *spa)
 {
 	return (spa->spa_bootfs);
@@ -2711,10 +2745,19 @@ spa_scan_stat_init(spa_t *spa)
 		spa->spa_scan_pass_scrub_pause = spa->spa_scan_pass_start;
 	else
 		spa->spa_scan_pass_scrub_pause = 0;
+
+	if (dsl_errorscrub_is_paused(spa->spa_dsl_pool->dp_scan))
+		spa->spa_scan_pass_errorscrub_pause = spa->spa_scan_pass_start;
+	else
+		spa->spa_scan_pass_errorscrub_pause = 0;
+
 	spa->spa_scan_pass_scrub_spent_paused = 0;
 	spa->spa_scan_pass_exam = 0;
 	spa->spa_scan_pass_issued = 0;
 	vdev_scan_stat_init(spa->spa_root_vdev);
+
+	// error scrub stats
+	spa->spa_scan_pass_errorscrub_spent_paused = 0;
 }
 
 /*
@@ -2725,9 +2768,11 @@ spa_scan_get_stats(spa_t *spa, pool_scan_stat_t *ps)
 {
 	dsl_scan_t *scn = spa->spa_dsl_pool ? spa->spa_dsl_pool->dp_scan : NULL;
 
-	if (scn == NULL || scn->scn_phys.scn_func == POOL_SCAN_NONE)
+	if (scn == NULL || (scn->scn_phys.scn_func == POOL_SCAN_NONE &&
+	    scn->errorscrub_phys.dep_func == POOL_SCAN_NONE))
 		return (SET_ERROR(ENOENT));
-	bzero(ps, sizeof (pool_scan_stat_t));
+
+	memset(ps, 0, sizeof (pool_scan_stat_t));
 
 	/* data stored on disk */
 	ps->pss_func = scn->scn_phys.scn_func;
@@ -2748,6 +2793,18 @@ spa_scan_get_stats(spa_t *spa, pool_scan_stat_t *ps)
 	ps->pss_pass_issued = spa->spa_scan_pass_issued;
 	ps->pss_issued =
 	    scn->scn_issued_before_pass + spa->spa_scan_pass_issued;
+
+	/* error scrub data stored on disk */
+	ps->pss_error_scrub_func = scn->errorscrub_phys.dep_func;
+	ps->pss_error_scrub_state = scn->errorscrub_phys.dep_state;
+	ps->pss_error_scrub_start = scn->errorscrub_phys.dep_start_time;
+	ps->pss_error_scrub_end = scn->errorscrub_phys.dep_end_time;
+	ps->pss_error_scrub_examined = scn->errorscrub_phys.dep_examined;
+	ps->pss_error_scrub_to_be_examined =
+	    scn->errorscrub_phys.dep_to_examine;
+
+	/* error scrub data not stored on disk */
+	ps->pss_pass_error_scrub_pause = spa->spa_scan_pass_errorscrub_pause;
 
 	return (0);
 }

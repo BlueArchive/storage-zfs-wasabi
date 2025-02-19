@@ -130,6 +130,10 @@ static int zpool_do_wait(int, char **);
 static zpool_compat_status_t zpool_do_load_compat(
     const char *, boolean_t *);
 
+enum zpool_options {
+        ZPOOL_OPTION_FORCE_ZIL_FAIL = 2048
+};
+
 /*
  * These libumem hooks provide a reasonable set of defaults for the allocator's
  * debugging facilities.
@@ -396,7 +400,8 @@ get_usage(zpool_help_t idx)
 		return (gettext("\tinitialize [-c | -s] [-w] <pool> "
 		    "[<device> ...]\n"));
 	case HELP_SCRUB:
-		return (gettext("\tscrub [-s | -p] [-w] <pool> ...\n"));
+		return (gettext("\tscrub [-e | -s | -p | -C] [-w] "
+		    "<pool> ...\n"));
 	case HELP_RESILVER:
 		return (gettext("\tresilver <pool> ...\n"));
 	case HELP_TRIM:
@@ -7114,13 +7119,22 @@ zpool_do_clear(int argc, char **argv)
 	boolean_t dryrun = B_FALSE;
 	boolean_t do_rewind = B_FALSE;
 	boolean_t xtreme_rewind = B_FALSE;
+	boolean_t force_zil_fail = B_FALSE;
 	uint32_t rewind_policy = ZPOOL_NO_REWIND;
-	nvlist_t *policy = NULL;
+	nvlist_t *nvopts = NULL;
 	zpool_handle_t *zhp;
 	char *pool, *device;
 
+	struct option long_options[] = {
+		{"force-zil-fail", no_argument, NULL,
+		    ZPOOL_OPTION_FORCE_ZIL_FAIL},
+		{0, 0, 0, 0}
+        };
+
+
 	/* check options */
-	while ((c = getopt(argc, argv, "FnX")) != -1) {
+	while ((c = getopt_long(argc, argv, "FnX", long_options,
+	    NULL)) != -1) {
 		switch (c) {
 		case 'F':
 			do_rewind = B_TRUE;
@@ -7130,6 +7144,9 @@ zpool_do_clear(int argc, char **argv)
 			break;
 		case 'X':
 			xtreme_rewind = B_TRUE;
+			break;
+		case ZPOOL_OPTION_FORCE_ZIL_FAIL:
+			force_zil_fail = B_TRUE;
 			break;
 		case '?':
 			(void) fprintf(stderr, gettext("invalid option '%c'\n"),
@@ -7151,11 +7168,17 @@ zpool_do_clear(int argc, char **argv)
 		usage(B_FALSE);
 	}
 
+	if (force_zil_fail && (dryrun || xtreme_rewind || do_rewind)) {
+		(void) fprintf(stderr, gettext(
+		    "--force-zil-fail with rewind option makes no sense\n"));
+		usage(B_FALSE);
+	}
 	if ((dryrun || xtreme_rewind) && !do_rewind) {
 		(void) fprintf(stderr,
 		    gettext("-n or -X only meaningful with -F\n"));
 		usage(B_FALSE);
 	}
+
 	if (dryrun)
 		rewind_policy = ZPOOL_TRY_REWIND;
 	else if (do_rewind)
@@ -7163,10 +7186,16 @@ zpool_do_clear(int argc, char **argv)
 	if (xtreme_rewind)
 		rewind_policy |= ZPOOL_EXTREME_REWIND;
 
-	/* In future, further rewind policy choices can be passed along here */
-	if (nvlist_alloc(&policy, NV_UNIQUE_NAME, 0) != 0 ||
-	    nvlist_add_uint32(policy, ZPOOL_LOAD_REWIND_POLICY,
+	if (nvlist_alloc(&nvopts, NV_UNIQUE_NAME, 0) != 0)
+		return (1);
+	if (nvlist_add_uint32(nvopts, ZPOOL_LOAD_REWIND_POLICY,
 	    rewind_policy) != 0) {
+		nvlist_free(nvopts);
+		return (1);
+	}
+	if (force_zil_fail && nvlist_add_boolean_value(nvopts,
+	    ZFS_CLEAR_FORCE_ZIL_FAIL, B_TRUE) != 0) {
+		nvlist_free(nvopts);
 		return (1);
 	}
 
@@ -7174,16 +7203,23 @@ zpool_do_clear(int argc, char **argv)
 	device = argc == 2 ? argv[1] : NULL;
 
 	if ((zhp = zpool_open_canfail(g_zfs, pool)) == NULL) {
-		nvlist_free(policy);
+		nvlist_free(nvopts);
 		return (1);
 	}
 
-	if (zpool_clear(zhp, device, policy) != 0)
+	if (zpool_clear(zhp, device, nvopts) != 0) {
 		ret = 1;
+		if (libzfs_errno(g_zfs) == EZFS_ZIL_FAILED) {
+			(void) fprintf(stderr, gettext("reboot is recommended "
+			    "to ensure the pool is returned to a known good "
+			    "state.\nto force it, rerun `zpool clear` with "
+			    "`--force-zil-failed`\n"));
+		}
+	}
 
 	zpool_close(zhp);
 
-	nvlist_free(policy);
+	nvlist_free(nvopts);
 
 	return (ret);
 }
@@ -7348,11 +7384,13 @@ wait_callback(zpool_handle_t *zhp, void *data)
 }
 
 /*
- * zpool scrub [-s | -p] [-w] <pool> ...
+ * zpool scrub [-e | -s | -p | -C] [-w] <pool> ...
  *
+ *	-e	Only scrub blocks in the error log.
  *	-s	Stop.  Stops any in-progress scrub.
  *	-p	Pause. Pause in-progress scrub.
  *	-w	Wait.  Blocks until scrub has completed.
+ *	-C	Scrub from last saved txg.
  */
 int
 zpool_do_scrub(int argc, char **argv)
@@ -7365,17 +7403,28 @@ zpool_do_scrub(int argc, char **argv)
 	cb.cb_type = POOL_SCAN_SCRUB;
 	cb.cb_scrub_cmd = POOL_SCRUB_NORMAL;
 
+	boolean_t is_error_scrub = B_FALSE;
+	boolean_t is_pause = B_FALSE;
+	boolean_t is_stop = B_FALSE;
+	boolean_t is_txg_continue = B_FALSE;
+
 	/* check options */
-	while ((c = getopt(argc, argv, "spw")) != -1) {
+	while ((c = getopt(argc, argv, "spweC")) != -1) {
 		switch (c) {
+		case 'e':
+			is_error_scrub = B_TRUE;
+			break;
 		case 's':
-			cb.cb_type = POOL_SCAN_NONE;
+			is_stop = B_TRUE;
 			break;
 		case 'p':
-			cb.cb_scrub_cmd = POOL_SCRUB_PAUSE;
+			is_pause = B_TRUE;
 			break;
 		case 'w':
 			wait = B_TRUE;
+			break;
+		case 'C':
+			is_txg_continue = B_TRUE;
 			break;
 		case '?':
 			(void) fprintf(stderr, gettext("invalid option '%c'\n"),
@@ -7384,11 +7433,35 @@ zpool_do_scrub(int argc, char **argv)
 		}
 	}
 
-	if (cb.cb_type == POOL_SCAN_NONE &&
-	    cb.cb_scrub_cmd == POOL_SCRUB_PAUSE) {
-		(void) fprintf(stderr, gettext("invalid option combination: "
-		    "-s and -p are mutually exclusive\n"));
+	if (is_pause && is_stop) {
+		(void) fprintf(stderr, gettext("invalid option "
+		    "combination :-s and -p are mutually exclusive\n"));
 		usage(B_FALSE);
+	} else if (is_pause && is_txg_continue) {
+		(void) fprintf(stderr, gettext("invalid option "
+		    "combination :-p and -C are mutually exclusive\n"));
+		usage(B_FALSE);
+	} else if (is_stop && is_txg_continue) {
+		(void) fprintf(stderr, gettext("invalid option "
+		    "combination :-s and -C are mutually exclusive\n"));
+		usage(B_FALSE);
+	} else if (is_error_scrub && is_txg_continue) {
+		(void) fprintf(stderr, gettext("invalid option "
+		    "combination :-e and -C are mutually exclusive\n"));
+		usage(B_FALSE);
+	} else {
+		if (is_error_scrub)
+			cb.cb_type = POOL_SCAN_ERRORSCRUB;
+
+		if (is_pause) {
+			cb.cb_scrub_cmd = POOL_SCRUB_PAUSE;
+		} else if (is_stop) {
+			cb.cb_type = POOL_SCAN_NONE;
+		} else if (is_txg_continue) {
+			cb.cb_scrub_cmd = POOL_SCRUB_FROM_LAST_TXG;
+		} else {
+			cb.cb_scrub_cmd = POOL_SCRUB_NORMAL;
+		}
 	}
 
 	if (wait && (cb.cb_type == POOL_SCAN_NONE ||
@@ -7609,6 +7682,70 @@ secs_to_dhms(uint64_t total, char *buf)
 		    (u_longlong_t)hours, (u_longlong_t)mins,
 		    (u_longlong_t)secs);
 	}
+}
+
+/*
+ * Print out detailed error scrub status.
+ */
+static void
+print_err_scrub_status(pool_scan_stat_t *ps)
+{
+	time_t start, end, pause;
+	uint64_t total_secs_left;
+	uint64_t secs_left, mins_left, hours_left, days_left;
+	uint64_t examined, to_be_examined;
+
+	if (ps == NULL || ps->pss_error_scrub_func != POOL_SCAN_ERRORSCRUB) {
+		return;
+	}
+
+	(void) printf(gettext(" scrub: "));
+
+	start = ps->pss_error_scrub_start;
+	end = ps->pss_error_scrub_end;
+	pause = ps->pss_pass_error_scrub_pause;
+	examined = ps->pss_error_scrub_examined;
+	to_be_examined = ps->pss_error_scrub_to_be_examined;
+
+	assert(ps->pss_error_scrub_func == POOL_SCAN_ERRORSCRUB);
+
+	if (ps->pss_error_scrub_state == DSS_FINISHED) {
+		total_secs_left = end - start;
+		days_left = total_secs_left / 60 / 60 / 24;
+		hours_left = (total_secs_left / 60 / 60) % 24;
+		mins_left = (total_secs_left / 60) % 60;
+		secs_left = (total_secs_left % 60);
+
+		(void) printf(gettext("scrubbed %llu error blocks in %llu days "
+		    "%02llu:%02llu:%02llu on %s"), (u_longlong_t)examined,
+		    (u_longlong_t)days_left, (u_longlong_t)hours_left,
+		    (u_longlong_t)mins_left, (u_longlong_t)secs_left,
+		    ctime(&end));
+
+		return;
+	} else if (ps->pss_error_scrub_state == DSS_CANCELED) {
+		(void) printf(gettext("error scrub canceled on %s"),
+		    ctime(&end));
+		return;
+	}
+	assert(ps->pss_error_scrub_state == DSS_ERRORSCRUBBING);
+
+	/* Error scrub is in progress. */
+	if (pause == 0) {
+		(void) printf(gettext("error scrub in progress since %s"),
+		    ctime(&start));
+	} else {
+		(void) printf(gettext("error scrub paused since %s"),
+		    ctime(&pause));
+		(void) printf(gettext("\terror scrub started on %s"),
+		    ctime(&start));
+	}
+
+	double fraction_done = (double)examined / (to_be_examined + examined);
+	(void) printf(gettext("\t%.2f%% done, issued I/O for %llu error"
+	    " blocks"), 100 * fraction_done, (u_longlong_t)examined);
+
+	(void) printf("\n");
 }
 
 /*
@@ -7936,10 +8073,12 @@ print_scan_status(zpool_handle_t *zhp, nvlist_t *nvroot)
 {
 	uint64_t rebuild_end_time = 0, resilver_end_time = 0;
 	boolean_t have_resilver = B_FALSE, have_scrub = B_FALSE;
+	boolean_t have_errorscrub = B_FALSE;
 	boolean_t active_resilver = B_FALSE;
 	pool_checkpoint_stat_t *pcs = NULL;
 	pool_scan_stat_t *ps = NULL;
 	uint_t c;
+	time_t scrub_start = 0, errorscrub_start = 0;
 
 	if (nvlist_lookup_uint64_array(nvroot, ZPOOL_CONFIG_SCAN_STATS,
 	    (uint64_t **)&ps, &c) == 0) {
@@ -7948,16 +8087,23 @@ print_scan_status(zpool_handle_t *zhp, nvlist_t *nvroot)
 			active_resilver = (ps->pss_state == DSS_SCANNING);
 		}
 
+
 		have_resilver = (ps->pss_func == POOL_SCAN_RESILVER);
 		have_scrub = (ps->pss_func == POOL_SCAN_SCRUB);
+		scrub_start = ps->pss_start_time;
+		have_errorscrub = (ps->pss_error_scrub_func ==
+		    POOL_SCAN_ERRORSCRUB);
+		errorscrub_start = ps->pss_error_scrub_start;
 	}
 
 	boolean_t active_rebuild = check_rebuilding(nvroot, &rebuild_end_time);
 	boolean_t have_rebuild = (active_rebuild || (rebuild_end_time > 0));
 
 	/* Always print the scrub status when available. */
-	if (have_scrub)
+	if (have_scrub && scrub_start > errorscrub_start)
 		print_scan_scrub_resilver_status(ps);
+	else if (have_errorscrub && errorscrub_start >= scrub_start)
+		print_err_scrub_status(ps);
 
 	/*
 	 * When there is an active resilver or rebuild print its status.
@@ -8710,37 +8856,17 @@ status_callback(zpool_handle_t *zhp, void *data)
 
 		if (nvlist_lookup_uint64(config, ZPOOL_CONFIG_ERRCOUNT,
 		    &nerr) == 0) {
-			nvlist_t *nverrlist = NULL;
-
-			/*
-			 * If the approximate error count is small, get a
-			 * precise count by fetching the entire log and
-			 * uniquifying the results.
-			 */
-			if (nerr > 0 && nerr < 100 && !cbp->cb_verbose &&
-			    zpool_get_errlog(zhp, &nverrlist) == 0) {
-				nvpair_t *elem;
-
-				elem = NULL;
-				nerr = 0;
-				while ((elem = nvlist_next_nvpair(nverrlist,
-				    elem)) != NULL) {
-					nerr++;
-				}
-			}
-			nvlist_free(nverrlist);
-
 			(void) printf("\n");
-
-			if (nerr == 0)
-				(void) printf(gettext("errors: No known data "
-				    "errors\n"));
-			else if (!cbp->cb_verbose)
+			if (nerr == 0) {
+				(void) printf(gettext(
+				    "errors: No known data errors\n"));
+			} else if (!cbp->cb_verbose) {
 				(void) printf(gettext("errors: %llu data "
 				    "errors, use '-v' for a list\n"),
 				    (u_longlong_t)nerr);
-			else
+			} else {
 				print_error_log(zhp);
+			}
 		}
 
 		if (cbp->cb_dedup_stats)

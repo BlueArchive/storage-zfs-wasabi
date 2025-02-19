@@ -126,11 +126,14 @@ typedef enum zfs_error {
 	EZFS_THREADCREATEFAILED, /* thread create failed */
 	EZFS_POSTSPLIT_ONLINE,	/* onlining a disk after splitting it */
 	EZFS_SCRUBBING,		/* currently scrubbing */
+	EZFS_ERRORSCRUBBING,	/* currently error scrubbing */
+	EZFS_ERRORSCRUB_PAUSED,	/* error scrub currently paused */
 	EZFS_NO_SCRUB,		/* no active scrub */
 	EZFS_DIFF,		/* general failure of zfs diff */
 	EZFS_DIFFDATA,		/* bad zfs diff data */
 	EZFS_POOLREADONLY,	/* pool is in read-only mode */
 	EZFS_SCRUB_PAUSED,	/* scrub currently paused */
+	EZFS_SCRUB_PAUSED_TO_CANCEL,	/* scrub currently paused */
 	EZFS_ACTIVE_POOL,	/* pool is imported on a different system */
 	EZFS_CRYPTOFAILED,	/* failed to setup encryption */
 	EZFS_NO_PENDING,	/* cannot cancel, no operation is pending */
@@ -150,6 +153,7 @@ typedef enum zfs_error {
 	EZFS_NO_RESILVER_DEFER,	/* pool doesn't support resilver_defer */
 	EZFS_EXPORT_IN_PROGRESS,	/* currently exporting the pool */
 	EZFS_REBUILDING,	/* resilvering (sequential reconstrution) */
+	EZFS_ZIL_FAILED,	/* zil failed */
 	EZFS_UNKNOWN
 } zfs_error_t;
 

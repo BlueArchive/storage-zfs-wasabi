@@ -4,4 +4,9 @@ dist_pkgdata_SCRIPTS = \
 	cleanup.ksh \
 	zpool_status_001_pos.ksh \
 	zpool_status_002_pos.ksh \
+	zpool_status_003_pos.ksh \
+	zpool_status_004_pos.ksh \
+	zpool_status_005_pos.ksh \
+	zpool_status_006_pos.ksh \
+	zpool_status_007_pos.ksh \
 	zpool_status_features_001_pos.ksh

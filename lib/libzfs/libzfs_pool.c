@@ -2486,49 +2486,84 @@ out:
 int
 zpool_scan(zpool_handle_t *zhp, pool_scan_func_t func, pool_scrub_cmd_t cmd)
 {
-	zfs_cmd_t zc = {"\0"};
 	char msg[1024];
 	int err;
 	libzfs_handle_t *hdl = zhp->zpool_hdl;
 
-	(void) strlcpy(zc.zc_name, zhp->zpool_name, sizeof (zc.zc_name));
-	zc.zc_cookie = func;
-	zc.zc_flags = cmd;
+	nvlist_t *args = fnvlist_alloc();
+	fnvlist_add_uint64(args, "scan_type", (uint64_t)func);
+	fnvlist_add_uint64(args, "scan_command", (uint64_t)cmd);
 
-	if (zfs_ioctl(hdl, ZFS_IOC_POOL_SCAN, &zc) == 0)
+	err = lzc_scrub(ZFS_IOC_POOL_SCRUB, zhp->zpool_name, args, NULL);
+	fnvlist_free(args);
+
+	if (err == 0) {
 		return (0);
+	} else if (err == ZFS_ERR_IOC_CMD_UNAVAIL) {
+		zfs_cmd_t zc = {"\0"};
+		(void) strlcpy(zc.zc_name, zhp->zpool_name,
+		    sizeof (zc.zc_name));
+		zc.zc_cookie = func;
+		zc.zc_flags = cmd;
 
-	err = errno;
+		if (zfs_ioctl(hdl, ZFS_IOC_POOL_SCAN, &zc) == 0)
+			return (0);
+	}
 
-	/* ECANCELED on a scrub means we resumed a paused scrub */
-	if (err == ECANCELED && func == POOL_SCAN_SCRUB &&
-	    cmd == POOL_SCRUB_NORMAL)
+	/*
+	 * An ECANCELED on a scrub means one of the following:
+	 * 1. we resumed a paused scrub.
+	 * 2. we resumed a paused error scrub.
+	 * 3. Error scrub is not run because of no error log.
+	 */
+	if (err == ECANCELED && (func == POOL_SCAN_SCRUB ||
+	    func == POOL_SCAN_ERRORSCRUB) && cmd == POOL_SCRUB_NORMAL)
 		return (0);
-
-	if (err == ENOENT && func != POOL_SCAN_NONE && cmd == POOL_SCRUB_NORMAL)
+	/*
+	 * The following cases have been handled here:
+	 * 1. Paused a scrub/error scrub if there is none in progress.
+	 */
+	if (err == ENOENT && func != POOL_SCAN_NONE && cmd ==
+	    POOL_SCRUB_PAUSE) {
 		return (0);
+	}
 
-	if (func == POOL_SCAN_SCRUB) {
+	ASSERT3U(func, >=, POOL_SCAN_NONE);
+	ASSERT3U(func, <, POOL_SCAN_FUNCS);
+
+	if (func == POOL_SCAN_SCRUB || func == POOL_SCAN_ERRORSCRUB) {
 		if (cmd == POOL_SCRUB_PAUSE) {
-			(void) snprintf(msg, sizeof (msg), dgettext(TEXT_DOMAIN,
-			    "cannot pause scrubbing %s"), zc.zc_name);
+			(void) snprintf(msg, sizeof (msg),
+			    dgettext(TEXT_DOMAIN, "cannot pause scrubbing %s"),
+			    zhp->zpool_name);
 		} else {
 			assert(cmd == POOL_SCRUB_NORMAL);
-			(void) snprintf(msg, sizeof (msg), dgettext(TEXT_DOMAIN,
-			    "cannot scrub %s"), zc.zc_name);
+			(void) snprintf(msg, sizeof (msg),
+			    dgettext(TEXT_DOMAIN, "cannot scrub %s"),
+			    zhp->zpool_name);
 		}
 	} else if (func == POOL_SCAN_RESILVER) {
 		assert(cmd == POOL_SCRUB_NORMAL);
 		(void) snprintf(msg, sizeof (msg), dgettext(TEXT_DOMAIN,
-		    "cannot restart resilver on %s"), zc.zc_name);
+		    "cannot restart resilver on %s"), zhp->zpool_name);
 	} else if (func == POOL_SCAN_NONE) {
-		(void) snprintf(msg, sizeof (msg),
-		    dgettext(TEXT_DOMAIN, "cannot cancel scrubbing %s"),
-		    zc.zc_name);
+		(void) snprintf(msg, sizeof (msg), dgettext(TEXT_DOMAIN,
+		    "cannot cancel scrubbing %s"), zhp->zpool_name);
 	} else {
 		assert(!"unexpected result");
 	}
 
+	/*
+	 * With EBUSY, five cases are possible:
+	 *
+	 * Current state		Requested
+	 * 1. Normal Scrub Running	Normal Scrub or Error Scrub
+	 * 2. Normal Scrub Paused	Error Scrub
+	 * 3. Normal Scrub Paused 	Pause Normal Scrub
+	 * 4. Error Scrub Running	Normal Scrub or Error Scrub
+	 * 5. Error Scrub Paused	Pause Error Scrub
+	 * 6. Resilvering		Anything else
+	 */
 	if (err == EBUSY) {
 		nvlist_t *nvroot;
 		pool_scan_stat_t *ps = NULL;
@@ -2540,11 +2575,43 @@ zpool_scan(zpool_handle_t *zhp, pool_scan_func_t func, pool_scrub_cmd_t cmd)
 		    ZPOOL_CONFIG_SCAN_STATS, (uint64_t **)&ps, &psc);
 		if (ps && ps->pss_func == POOL_SCAN_SCRUB &&
 		    ps->pss_state == DSS_SCANNING) {
-			if (cmd == POOL_SCRUB_PAUSE)
-				return (zfs_error(hdl, EZFS_SCRUB_PAUSED, msg));
-			else
-				return (zfs_error(hdl, EZFS_SCRUBBING, msg));
+			if (ps->pss_pass_scrub_pause == 0) {
+				/* handles case 1 */
+				assert(cmd == POOL_SCRUB_NORMAL);
+				return (zfs_error(hdl, EZFS_SCRUBBING,
+				    msg));
+			} else {
+				if (func == POOL_SCAN_ERRORSCRUB) {
+					/* handles case 2 */
+					ASSERT3U(cmd, ==, POOL_SCRUB_NORMAL);
+					return (zfs_error(hdl,
+					    EZFS_SCRUB_PAUSED_TO_CANCEL,
+					    msg));
+				} else {
+					/* handles case 3 */
+					ASSERT3U(func, ==, POOL_SCAN_SCRUB);
+					ASSERT3U(cmd, ==, POOL_SCRUB_PAUSE);
+					return (zfs_error(hdl,
+					    EZFS_SCRUB_PAUSED, msg));
+				}
+			}
+		} else if (ps &&
+		    ps->pss_error_scrub_func == POOL_SCAN_ERRORSCRUB &&
+		    ps->pss_error_scrub_state == DSS_ERRORSCRUBBING) {
+			if (ps->pss_pass_error_scrub_pause == 0) {
+				/* handles case 4 */
+				ASSERT3U(cmd, ==, POOL_SCRUB_NORMAL);
+				return (zfs_error(hdl, EZFS_ERRORSCRUBBING,
+				    msg));
+			} else {
+				/* handles case 5 */
+				ASSERT3U(func, ==, POOL_SCAN_ERRORSCRUB);
+				ASSERT3U(cmd, ==, POOL_SCRUB_PAUSE);
+				return (zfs_error(hdl, EZFS_ERRORSCRUB_PAUSED,
+				    msg));
+			}
 		} else {
+			/* handles case 6 */
 			return (zfs_error(hdl, EZFS_RESILVERING, msg));
 		}
 	} else if (err == ENOENT) {
@@ -4234,34 +4301,28 @@ zpool_get_errlog(zpool_handle_t *zhp, nvlist_t **nverrlistp)
 {
 	zfs_cmd_t zc = {"\0"};
 	libzfs_handle_t *hdl = zhp->zpool_hdl;
-	uint64_t count;
-	zbookmark_phys_t *zb = NULL;
-	int i;
+	zbookmark_phys_t *buf;
+	uint64_t buflen = 10000; /* approx. 1MB of RAM */
+
+	if (fnvlist_lookup_uint64(zhp->zpool_config,
+	    ZPOOL_CONFIG_ERRCOUNT) == 0)
+		return (0);
 
 	/*
-	 * Retrieve the raw error list from the kernel.  If the number of errors
-	 * has increased, allocate more space and continue until we get the
-	 * entire list.
+	 * Retrieve the raw error list from the kernel.  If it doesn't fit,
+	 * allocate a larger buffer and retry.
 	 */
-	verify(nvlist_lookup_uint64(zhp->zpool_config, ZPOOL_CONFIG_ERRCOUNT,
-	    &count) == 0);
-	if (count == 0)
-		return (0);
-	zc.zc_nvlist_dst = (uintptr_t)zfs_alloc(zhp->zpool_hdl,
-	    count * sizeof (zbookmark_phys_t));
-	zc.zc_nvlist_dst_size = count;
 	(void) strcpy(zc.zc_name, zhp->zpool_name);
 	for (;;) {
+		buf = zfs_alloc(zhp->zpool_hdl,
+		    buflen * sizeof (zbookmark_phys_t));
+		zc.zc_nvlist_dst = (uintptr_t)buf;
+		zc.zc_nvlist_dst_size = buflen;
 		if (zfs_ioctl(zhp->zpool_hdl, ZFS_IOC_ERROR_LOG,
 		    &zc) != 0) {
-			free((void *)(uintptr_t)zc.zc_nvlist_dst);
+			free(buf);
 			if (errno == ENOMEM) {
-				void *dst;
-
-				count = zc.zc_nvlist_dst_size;
-				dst = zfs_alloc(zhp->zpool_hdl, count *
-				    sizeof (zbookmark_phys_t));
-				zc.zc_nvlist_dst = (uintptr_t)dst;
+				buflen *= 2;
 			} else {
 				return (zpool_standard_error_fmt(hdl, errno,
 				    dgettext(TEXT_DOMAIN, "errors: List of "
@@ -4279,18 +4340,17 @@ zpool_get_errlog(zpool_handle_t *zhp, nvlist_t **nverrlistp)
 	 * _not_ copied as part of the process.  So we point the start of our
 	 * array appropriate and decrement the total number of elements.
 	 */
-	zb = ((zbookmark_phys_t *)(uintptr_t)zc.zc_nvlist_dst) +
-	    zc.zc_nvlist_dst_size;
-	count -= zc.zc_nvlist_dst_size;
+	zbookmark_phys_t *zb = buf + zc.zc_nvlist_dst_size;
+	uint64_t zblen = buflen - zc.zc_nvlist_dst_size;
 
-	qsort(zb, count, sizeof (zbookmark_phys_t), zbookmark_mem_compare);
+	qsort(zb, zblen, sizeof (zbookmark_phys_t), zbookmark_mem_compare);
 
 	verify(nvlist_alloc(nverrlistp, 0, KM_SLEEP) == 0);
 
 	/*
 	 * Fill in the nverrlistp with nvlist's of dataset and object numbers.
 	 */
-	for (i = 0; i < count; i++) {
+	for (uint64_t i = 0; i < zblen; i++) {
 		nvlist_t *nv;
 
 		/* ignoring zb_blkid and zb_level for now */
@@ -4317,11 +4377,11 @@ zpool_get_errlog(zpool_handle_t *zhp, nvlist_t **nverrlistp)
 		nvlist_free(nv);
 	}
 
-	free((void *)(uintptr_t)zc.zc_nvlist_dst);
+	free(buf);
 	return (0);
 
 nomem:
-	free((void *)(uintptr_t)zc.zc_nvlist_dst);
+	free(buf);
 	return (no_memory(zhp->zpool_hdl));
 }
 

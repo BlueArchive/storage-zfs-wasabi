@@ -576,7 +576,8 @@ error:
 	if (ret == ECKSUM) {
 		zio->io_error = SET_ERROR(EIO);
 		if ((zio->io_flags & ZIO_FLAG_SPECULATIVE) == 0) {
-			spa_log_error(spa, &zio->io_bookmark);
+			spa_log_error(spa, &zio->io_bookmark,
+			    &zio->io_bp->blk_birth);
 			(void) zfs_ereport_post(FM_EREPORT_ZFS_AUTHENTICATION,
 			    spa, NULL, &zio->io_bookmark, zio, 0);
 		}
@@ -2538,7 +2539,7 @@ zio_suspend(spa_t *spa, zio_t *zio, zio_suspend_reason_t reason)
 		if (reason != ZIO_SUSPEND_MMP) {
 			cmn_err(CE_WARN, "Pool '%s' has encountered an "
 			    "uncorrectable I/O failure and has been "
-			    "suspended.\n", spa_name(spa));
+			    "suspended.", spa_name(spa));
 		}
 
 		(void) zfs_ereport_post(FM_EREPORT_ZFS_IO_FAILURE, spa, NULL,
@@ -2576,13 +2577,19 @@ static zio_t *
 zio_unsuspend(spa_t *spa)
 {
 	zio_t *pio;
+	zio_suspend_reason_t reason;
 
 	mutex_enter(&spa->spa_suspend_lock);
+	reason = spa->spa_suspended;
 	spa->spa_suspended = ZIO_SUSPEND_NONE;
 	cv_broadcast(&spa->spa_suspend_cv);
 	pio = spa->spa_suspend_zio_root;
 	spa->spa_suspend_zio_root = NULL;
 	mutex_exit(&spa->spa_suspend_lock);
+
+	if (reason != ZIO_SUSPEND_NONE) 
+		cmn_err(CE_WARN, "Pool '%s' has been unsuspended.",
+		    spa_name(spa));
 
 	return (pio);
 }
@@ -4877,7 +4884,8 @@ zio_done(zio_t *zio)
 			 * For logical I/O requests, tell the SPA to log the
 			 * error and generate a logical data ereport.
 			 */
-			spa_log_error(zio->io_spa, &zio->io_bookmark);
+			spa_log_error(zio->io_spa, &zio->io_bookmark,
+			    &zio->io_bp->blk_birth);
 			(void) zfs_ereport_post(FM_EREPORT_ZFS_DATA,
 			    zio->io_spa, NULL, &zio->io_bookmark, zio, 0);
 		}

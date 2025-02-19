@@ -2,6 +2,8 @@ include $(top_srcdir)/config/Rules.am
 
 sbin_PROGRAMS = zstream
 
+AM_CPPFLAGS += $(LIBZPOOL_CPPFLAGS)
+
 zstream_SOURCES = \
 	zstream.c \
 	zstream.h \

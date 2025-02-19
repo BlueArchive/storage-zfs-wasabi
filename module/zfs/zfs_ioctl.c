@@ -1711,6 +1711,50 @@ else if (zc->zc_cookie == POOL_SCAN_NONE)
 	return (error);
 }
 
+/*
+ * inputs:
+ * poolname             name of the pool
+ * scan_type            scan func (pool_scan_func_t)
+ * scan_command         scrub pause/resume flag (pool_scrub_cmd_t)
+ */
+static const zfs_ioc_key_t zfs_keys_pool_scrub[] = {
+	{"scan_type",		DATA_TYPE_UINT64,	0},
+	{"scan_command",	DATA_TYPE_UINT64,	0},
+};
+
+static int
+zfs_ioc_pool_scrub(const char *poolname, nvlist_t *innvl, nvlist_t *outnvl)
+{
+	spa_t *spa;
+	int error;
+	uint64_t scan_type, scan_cmd;
+
+	if (nvlist_lookup_uint64(innvl, "scan_type", &scan_type) != 0)
+		return (SET_ERROR(EINVAL));
+	if (nvlist_lookup_uint64(innvl, "scan_command", &scan_cmd) != 0)
+		return (SET_ERROR(EINVAL));
+
+	if (scan_cmd >= POOL_SCRUB_FLAGS_END)
+		return (SET_ERROR(EINVAL));
+
+	if ((error = spa_open(poolname, &spa, FTAG)) != 0)
+		return (error);
+
+	if (scan_cmd == POOL_SCRUB_PAUSE) {
+		error = spa_scrub_pause_resume(spa, POOL_SCRUB_PAUSE);
+	} else if (scan_type == POOL_SCAN_NONE) {
+		error = spa_scan_stop(spa);
+	} else if (scan_cmd == POOL_SCRUB_FROM_LAST_TXG) {
+		error = spa_scan_range(spa, scan_type,
+		    spa_get_last_scrubbed_txg(spa), 0);
+	} else {
+		error = spa_scan(spa, scan_type);
+	}
+
+	spa_close(spa, FTAG);
+	return (error);
+}
+
 static int
 zfs_ioc_pool_freeze(zfs_cmd_t *zc)
 {
@@ -5654,17 +5698,12 @@ zfs_ioc_error_log(zfs_cmd_t *zc)
 {
 	spa_t *spa;
 	int error;
-	size_t count = (size_t)zc->zc_nvlist_dst_size;
 
 	if ((error = spa_open(zc->zc_name, &spa, FTAG)) != 0)
 		return (error);
 
 	error = spa_get_errlog(spa, (void *)(uintptr_t)zc->zc_nvlist_dst,
-	    &count);
-	if (error == 0)
-		zc->zc_nvlist_dst_size = count;
-	else
-		zc->zc_nvlist_dst_size = spa_get_errlog_size(spa);
+	    &zc->zc_nvlist_dst_size);
 
 	spa_close(spa, FTAG);
 
@@ -5694,41 +5733,88 @@ zfs_ioc_clear(zfs_cmd_t *zc)
 	spa->spa_last_open_failed = 0;
 	mutex_exit(&spa_namespace_lock);
 
+	boolean_t force_zil_fail = B_FALSE;
+
+	nvlist_t *nvopts = NULL;
+	if (zc->zc_nvlist_src != 0) {
+		error = get_nvlist(zc->zc_nvlist_src, zc->zc_nvlist_src_size,
+		    zc->zc_iflags, &nvopts);
+		if (error != 0 && error != ENOENT)
+			return (error);
+	}
+
 	if (zc->zc_cookie & ZPOOL_NO_REWIND) {
+		if (nvopts != NULL) {
+			boolean_t opt;
+			error = nvlist_lookup_boolean_value(nvopts,
+			    ZFS_CLEAR_FORCE_ZIL_FAIL, &opt);
+			if (error != 0 && error != ENOENT)
+				goto done_opts;
+			if (error == 0)
+				force_zil_fail = opt;
+		}
 		error = spa_open(zc->zc_name, &spa, FTAG);
 	} else {
-		nvlist_t *policy;
+		if (nvopts == NULL) {
+			error = SET_ERROR(EINVAL);
+			goto done_opts;
+		}
+
 		nvlist_t *config = NULL;
+		error = spa_open_rewind(zc->zc_name, &spa, FTAG,
+		    nvopts, &config);
+		if (config != NULL) {
+			int err;
 
-		if (zc->zc_nvlist_src == 0)
-			return (SET_ERROR(EINVAL));
-
-		if ((error = get_nvlist(zc->zc_nvlist_src,
-		    zc->zc_nvlist_src_size, zc->zc_iflags, &policy)) == 0) {
-			error = spa_open_rewind(zc->zc_name, &spa, FTAG,
-			    policy, &config);
-			if (config != NULL) {
-				int err;
-
-				if ((err = put_nvlist(zc, config)) != 0)
-					error = err;
-				nvlist_free(config);
-			}
-			nvlist_free(policy);
+			if ((err = put_nvlist(zc, config)) != 0)
+				error = err;
+			nvlist_free(config);
 		}
 	}
 
+done_opts:
+	if (nvopts != NULL)
+		nvlist_free(nvopts);
+
 	if (error != 0)
 		return (error);
+
+	boolean_t suspended = spa_suspended(spa);
 
 	/*
 	 * If multihost is enabled, resuming I/O is unsafe as another
 	 * host may have imported the pool. Check for remote activity.
 	 */
-	if (spa_multihost(spa) && spa_suspended(spa) &&
+	if (suspended && spa_multihost(spa) &&
 	    spa_mmp_remote_host_activity(spa)) {
 		spa_close(spa, FTAG);
 		return (SET_ERROR(EREMOTEIO));
+	}
+
+	/* 
+	 * If the user hasn't explicitly asked that a failed ZIL be ignored,
+	 * check them all. If any have failed, eject.
+	 */
+	if (suspended && !force_zil_fail) {
+		boolean_t failed = B_FALSE;
+
+		dsl_pool_t *dp = spa->spa_dsl_pool;
+		for (int t = 0; t < TXG_SIZE; t++) {
+			for (zilog_t *zilog =
+			    txg_list_head(&dp->dp_dirty_zilogs, t);
+			    zilog != NULL; zilog =
+			    txg_list_next(&dp->dp_dirty_zilogs, zilog, t)) {
+				if (zil_failed(zilog)) {
+					failed = B_TRUE;
+					break;
+				}
+			}
+		}
+
+		if (failed) {
+			spa_close(spa, FTAG);
+			return (SET_ERROR(ZFS_ERR_ZIL_FAILED));
+		}
 	}
 
 	spa_vdev_state_enter(spa, SCL_NONE);
@@ -7178,6 +7264,11 @@ zfs_ioctl_init(void)
 	    zfs_ioc_get_bootenv, zfs_secpolicy_none, POOL_NAME,
 	    POOL_CHECK_SUSPENDED, B_FALSE, B_TRUE,
 	    zfs_keys_get_bootenv, ARRAY_SIZE(zfs_keys_get_bootenv));
+
+	zfs_ioctl_register("scrub", ZFS_IOC_POOL_SCRUB,
+	    zfs_ioc_pool_scrub, zfs_secpolicy_config, POOL_NAME,
+	    POOL_CHECK_NONE, B_TRUE, B_TRUE,
+	    zfs_keys_pool_scrub, ARRAY_SIZE(zfs_keys_pool_scrub));
 
 	/* IOCTLS that use the legacy function signature */
 
