@@ -159,7 +159,7 @@ tests = ['json_sanity']
 tags = ['functional', 'cli_root', 'json']
 
 [tests/functional/cli_root/zinject]
-tests = ['zinject_args']
+tests = ['zinject_args', 'zinject_counts', 'zinject_probe']
 pre =
 post =
 tags = ['functional', 'cli_root', 'zinject']
@@ -544,7 +544,8 @@ tags = ['functional', 'cli_root', 'zpool_scrub']
 [tests/functional/cli_root/zpool_set]
 tests = ['zpool_set_001_pos', 'zpool_set_002_neg', 'zpool_set_003_neg',
     'zpool_set_ashift', 'zpool_set_features', 'vdev_set_001_pos',
-    'user_property_001_pos', 'user_property_002_neg']
+    'user_property_001_pos', 'user_property_002_neg',
+    'zpool_set_clear_userprop']
 tags = ['functional', 'cli_root', 'zpool_set']
 
 [tests/functional/cli_root/zpool_split]
@@ -701,6 +702,10 @@ tests = ['dio_aligned_block', 'dio_async_always', 'dio_async_fio_ioengines',
     'dio_unaligned_block', 'dio_unaligned_filesize']
 tags = ['functional', 'direct']
 
+[tests/functional/events]
+tests = ['slow_vdev_sit_out']
+tags = ['functional', 'events']
+
 [tests/functional/exec]
 tests = ['exec_001_pos', 'exec_002_neg']
 tags = ['functional', 'exec']
@@ -708,6 +713,12 @@ tags = ['functional', 'exec']
 [tests/functional/fallocate]
 tests = ['fallocate_punch-hole']
 tags = ['functional', 'fallocate']
+
+[tests/functional/fsync]
+pre =
+post =
+tests = ['fsync_suspend_single', 'fsync_slog_fail']
+tags = ['functional', 'fsync']
 
 [tests/functional/features/async_destroy]
 tests = ['async_destroy_001_pos']
@@ -750,6 +761,12 @@ tags = ['functional', 'io']
 tests = ['inuse_004_pos', 'inuse_005_pos', 'inuse_008_pos', 'inuse_009_pos']
 post =
 tags = ['functional', 'inuse']
+
+[tests/functional/kstat]
+pre =
+post =
+tests = ['pool_status_json']
+tags = ['functional', 'kstat']
 
 [tests/functional/large_files]
 tests = ['large_files_001_pos', 'large_files_002_pos']
@@ -899,8 +916,8 @@ tags = ['functional', 'rename_dirs']
 tests = ['attach_import', 'attach_multiple', 'attach_rebuild',
     'attach_resilver', 'detach', 'rebuild_disabled_feature',
     'rebuild_multiple', 'rebuild_raidz', 'replace_import', 'replace_rebuild',
-    'replace_resilver', 'resilver_restart_001', 'resilver_restart_002',
-    'scrub_cancel']
+    'replace_resilver', 'replace_resilver_sit_out' 'resilver_restart_001',
+    'resilver_restart_002', 'scrub_cancel']
 tags = ['functional', 'replacement']
 
 [tests/functional/reservation]

@@ -23,7 +23,7 @@
  * Copyright (c) 2011, 2022 by Delphix. All rights reserved.
  * Copyright (c) 2011 Nexenta Systems, Inc. All rights reserved.
  * Copyright (c) 2017, Intel Corporation.
- * Copyright (c) 2019, 2023, 2024, Klara Inc.
+ * Copyright (c) 2019, 2023, 2024, 2025, Klara, Inc.
  * Copyright (c) 2019, Allan Jude
  * Copyright (c) 2021, Datto, Inc.
  * Copyright (c) 2021, 2024 by George Melikov. All rights reserved.
@@ -77,6 +77,7 @@ static int zio_deadman_log_all = B_FALSE;
  */
 static kmem_cache_t *zio_cache;
 static kmem_cache_t *zio_link_cache;
+static kmem_cache_t *zio_vdev_trace_cache;
 kmem_cache_t *zio_buf_cache[SPA_MAXBLOCKSIZE >> SPA_MINBLOCKSHIFT];
 kmem_cache_t *zio_data_buf_cache[SPA_MAXBLOCKSIZE >> SPA_MINBLOCKSHIFT];
 #if defined(ZFS_DEBUG) && !defined(_KERNEL)
@@ -145,9 +146,52 @@ static const int zio_buf_debug_limit = 16384;
 static const int zio_buf_debug_limit = 0;
 #endif
 
+typedef struct zio_stats {
+	kstat_named_t ziostat_total_allocations;
+	kstat_named_t ziostat_alloc_class_fallbacks;
+	kstat_named_t ziostat_gang_writes;
+	kstat_named_t ziostat_gang_multilevel;
+} zio_stats_t;
+
+static zio_stats_t zio_stats = {
+	{ "total_allocations",	KSTAT_DATA_UINT64 },
+	{ "alloc_class_fallbacks",	KSTAT_DATA_UINT64 },
+	{ "gang_writes",	KSTAT_DATA_UINT64 },
+	{ "gang_multilevel",	KSTAT_DATA_UINT64 },
+};
+
+struct {
+	wmsum_t ziostat_total_allocations;
+	wmsum_t ziostat_alloc_class_fallbacks;
+	wmsum_t ziostat_gang_writes;
+	wmsum_t ziostat_gang_multilevel;
+} ziostat_sums;
+
+#define	ZIOSTAT_BUMP(stat)	wmsum_add(&ziostat_sums.stat, 1);
+
+static kstat_t *zio_ksp;
+
 static inline void __zio_execute(zio_t *zio);
 
 static void zio_taskq_dispatch(zio_t *, zio_taskq_type_t, boolean_t);
+
+static int
+zio_kstats_update(kstat_t *ksp, int rw)
+{
+	zio_stats_t *zs = ksp->ks_data;
+	if (rw == KSTAT_WRITE)
+		return (EACCES);
+
+	zs->ziostat_total_allocations.value.ui64 =
+	    wmsum_value(&ziostat_sums.ziostat_total_allocations);
+	zs->ziostat_alloc_class_fallbacks.value.ui64 =
+	    wmsum_value(&ziostat_sums.ziostat_alloc_class_fallbacks);
+	zs->ziostat_gang_writes.value.ui64 =
+	    wmsum_value(&ziostat_sums.ziostat_gang_writes);
+	zs->ziostat_gang_multilevel.value.ui64 =
+	    wmsum_value(&ziostat_sums.ziostat_gang_multilevel);
+	return (0);
+}
 
 void
 zio_init(void)
@@ -158,6 +202,21 @@ zio_init(void)
 	    sizeof (zio_t), 0, NULL, NULL, NULL, NULL, NULL, 0);
 	zio_link_cache = kmem_cache_create("zio_link_cache",
 	    sizeof (zio_link_t), 0, NULL, NULL, NULL, NULL, NULL, 0);
+	zio_vdev_trace_cache = kmem_cache_create("zio_vdev_trace_cache",
+	    sizeof (zio_vdev_trace_t), 0, NULL, NULL, NULL, NULL, NULL, 0);
+
+	wmsum_init(&ziostat_sums.ziostat_total_allocations, 0);
+	wmsum_init(&ziostat_sums.ziostat_alloc_class_fallbacks, 0);
+	wmsum_init(&ziostat_sums.ziostat_gang_writes, 0);
+	wmsum_init(&ziostat_sums.ziostat_gang_multilevel, 0);
+	zio_ksp = kstat_create("zfs", 0, "zio_stats",
+	    "misc", KSTAT_TYPE_NAMED, sizeof (zio_stats) /
+	    sizeof (kstat_named_t), KSTAT_FLAG_VIRTUAL);
+	if (zio_ksp != NULL) {
+		zio_ksp->ks_data = &zio_stats;
+		zio_ksp->ks_update = zio_kstats_update;
+		kstat_install(zio_ksp);
+	}
 
 	for (c = 0; c < SPA_MAXBLOCKSIZE >> SPA_MINBLOCKSHIFT; c++) {
 		size_t size = (c + 1) << SPA_MINBLOCKSHIFT;
@@ -286,6 +345,17 @@ zio_fini(void)
 		VERIFY3P(zio_data_buf_cache[i], ==, NULL);
 	}
 
+	if (zio_ksp != NULL) {
+		kstat_delete(zio_ksp);
+		zio_ksp = NULL;
+	}
+
+	wmsum_fini(&ziostat_sums.ziostat_total_allocations);
+	wmsum_fini(&ziostat_sums.ziostat_alloc_class_fallbacks);
+	wmsum_fini(&ziostat_sums.ziostat_gang_writes);
+	wmsum_fini(&ziostat_sums.ziostat_gang_multilevel);
+
+	kmem_cache_destroy(zio_vdev_trace_cache);
 	kmem_cache_destroy(zio_link_cache);
 	kmem_cache_destroy(zio_cache);
 
@@ -810,6 +880,58 @@ zio_notify_parent(zio_t *pio, zio_t *zio, enum zio_wait_type wait,
 	if (zio->io_flags & ZIO_FLAG_DIO_CHKSUM_ERR)
 		pio->io_flags |= ZIO_FLAG_DIO_CHKSUM_ERR;
 
+	/*
+	 * If all of the following are true:
+	 *
+	 * - the parent has requested vdev tracing
+	 * - the child has just completed
+	 * - the child was for a real vdev
+	 * - the child is "interesting" for tracing purposes (see below)
+	 *
+	 * then we can stash some information about the vdev on the trace tree.
+	 *
+	 * "Interesting" means a vdev whose response was a direct contributor
+	 * to the success of the overall zio; that is, we only consider zios
+	 * that succeeded, and weren't something that was allowed or expected
+	 * to fail (eg an aggregation padding write).
+	 *
+	 * This is important for the initial use case (knowing which vdevs were
+	 * written to but not flushed), and is arguably correct for all cases
+	 * (a vdev that returned an error, by definition, did not participate
+	 * in the completing the zio). Its necessary in practice because an
+	 * error from a leaf does not necessarily mean its parent will error
+	 * out too (eg raidz can sometimes compensate for failed writes). If
+	 * some future case requires more complex filtering we can look at
+	 * stashing more info into zio_vdev_trace_t.
+	 */
+	if (pio->io_flags & ZIO_FLAG_VDEV_TRACE &&
+	    wait == ZIO_WAIT_DONE && zio->io_vd != NULL &&
+	    ((zio->io_flags & (ZIO_FLAG_OPTIONAL | ZIO_FLAG_IO_REPAIR)) == 0)) {
+		avl_tree_t *t = &pio->io_vdev_trace_tree;
+		zio_vdev_trace_t *zvt, zvt_search;
+		avl_index_t where;
+
+		if (zio->io_error == 0) {
+			zvt_search.zvt_guid = zio->io_vd->vdev_guid;
+			if (avl_find(t, &zvt_search, &where) == NULL) {
+				zvt = kmem_cache_alloc(
+				    zio_vdev_trace_cache, KM_SLEEP);
+				zvt->zvt_guid = zio->io_vd->vdev_guid;
+				avl_insert(t, zvt, where);
+			}
+		}
+
+		/*
+		 * If the child has itself collected trace records, copy them
+		 * to ours. Note that we can't steal them, as there may be
+		 * multiple parents.
+		 */
+		if (zio->io_flags & ZIO_FLAG_VDEV_TRACE) {
+			zio_vdev_trace_copy(&zio->io_vdev_trace_tree,
+			    &pio->io_vdev_trace_tree);
+		}
+	}
+
 	(*countp)--;
 
 	if (*countp == 0 && pio->io_stall == countp) {
@@ -896,6 +1018,92 @@ zio_bookmark_compare(const void *x1, const void *x2)
 	return (0);
 }
 
+static int
+zio_vdev_trace_compare(const void *x1, const void *x2)
+{
+	const uint64_t v1 = ((zio_vdev_trace_t *)x1)->zvt_guid;
+	const uint64_t v2 = ((zio_vdev_trace_t *)x2)->zvt_guid;
+
+	return (TREE_CMP(v1, v2));
+}
+
+void
+zio_vdev_trace_init(avl_tree_t *t)
+{
+	avl_create(t, zio_vdev_trace_compare, sizeof (zio_vdev_trace_t),
+	    offsetof(zio_vdev_trace_t, zvt_node));
+}
+
+void
+zio_vdev_trace_fini(avl_tree_t *t)
+{
+	ASSERT(avl_is_empty(t));
+	avl_destroy(t);
+}
+
+/*
+ * Copy trace records on src and add them to dst, skipping any that are already
+ * on dst.
+ */
+void
+zio_vdev_trace_copy(avl_tree_t *src, avl_tree_t *dst)
+{
+	zio_vdev_trace_t *zvt, *nzvt;
+	avl_index_t where;
+
+	for (zvt = avl_first(src); zvt != NULL; zvt = AVL_NEXT(src, zvt)) {
+		if (avl_find(dst, zvt, &where) == NULL) {
+			nzvt = kmem_cache_alloc(zio_vdev_trace_cache, KM_SLEEP);
+			nzvt->zvt_guid = zvt->zvt_guid;
+			avl_insert(dst, nzvt, where);
+		}
+	}
+}
+
+/* Move trace records from src to dst. src will be empty upon return. */
+void
+zio_vdev_trace_move(avl_tree_t *src, avl_tree_t *dst)
+{
+	zio_vdev_trace_t *zvt;
+	avl_index_t where;
+	void *cookie;
+
+	cookie = NULL;
+	while ((zvt = avl_destroy_nodes(src, &cookie)) != NULL) {
+		if (avl_find(dst, zvt, &where) == NULL)
+			avl_insert(dst, zvt, where);
+		else
+			kmem_cache_free(zio_vdev_trace_cache, zvt);
+	}
+
+	ASSERT(avl_is_empty(src));
+}
+
+void
+zio_vdev_trace_flush(zio_t *pio, avl_tree_t *t)
+{
+	spa_t *spa = pio->io_spa;
+	zio_vdev_trace_t *zvt;
+	vdev_t *vd;
+
+	for (zvt = avl_first(t); zvt != NULL; zvt = AVL_NEXT(t, zvt)) {
+		vd = vdev_lookup_by_guid(spa->spa_root_vdev, zvt->zvt_guid);
+		if (vd != NULL && vd->vdev_children == 0)
+			zio_flush(pio, vd, B_TRUE);
+	}
+}
+
+void
+zio_vdev_trace_empty(avl_tree_t *t)
+{
+	zio_vdev_trace_t *zvt;
+	void *cookie = NULL;
+	while ((zvt = avl_destroy_nodes(t, &cookie)) != NULL)
+		kmem_cache_free(zio_vdev_trace_cache, zvt);
+	ASSERT(avl_is_empty(t));
+}
+
+
 /*
  * ==========================================================================
  * Create the various types of I/O (read, write, free, etc)
@@ -932,6 +1140,8 @@ zio_create(zio_t *pio, spa_t *spa, uint64_t txg, const blkptr_t *bp,
 	list_create(&zio->io_child_list, sizeof (zio_link_t),
 	    offsetof(zio_link_t, zl_child_node));
 	metaslab_trace_init(&zio->io_alloc_list);
+
+	zio_vdev_trace_init(&zio->io_vdev_trace_tree);
 
 	if (vd != NULL)
 		zio->io_child_type = ZIO_CHILD_VDEV;
@@ -998,6 +1208,8 @@ zio_create(zio_t *pio, spa_t *spa, uint64_t txg, const blkptr_t *bp,
 void
 zio_destroy(zio_t *zio)
 {
+	zio_vdev_trace_empty(&zio->io_vdev_trace_tree);
+	zio_vdev_trace_fini(&zio->io_vdev_trace_tree);
 	metaslab_trace_fini(&zio->io_alloc_list);
 	list_destroy(&zio->io_parent_list);
 	list_destroy(&zio->io_child_list);
@@ -1662,10 +1874,10 @@ zio_vdev_delegated_io(vdev_t *vd, uint64_t offset, abd_t *data, uint64_t size,
  * the flushes complete.
  */
 void
-zio_flush(zio_t *pio, vdev_t *vd)
+zio_flush(zio_t *pio, vdev_t *vd, boolean_t propagate)
 {
-	const zio_flag_t flags = ZIO_FLAG_CANFAIL | ZIO_FLAG_DONT_PROPAGATE |
-	    ZIO_FLAG_DONT_RETRY;
+	const zio_flag_t flags = ZIO_FLAG_CANFAIL | ZIO_FLAG_DONT_RETRY |
+	    (propagate ? 0 : ZIO_FLAG_DONT_PROPAGATE);
 
 	if (vd->vdev_nowritecache)
 		return;
@@ -1676,7 +1888,7 @@ zio_flush(zio_t *pio, vdev_t *vd)
 		    NULL, ZIO_STAGE_OPEN, ZIO_FLUSH_PIPELINE));
 	} else {
 		for (uint64_t c = 0; c < vd->vdev_children; c++)
-			zio_flush(pio, vd->vdev_child[c]);
+			zio_flush(pio, vd->vdev_child[c], propagate);
 	}
 }
 
@@ -2537,13 +2749,29 @@ zio_reexecute(void *arg)
 	pio->io_state[ZIO_WAIT_READY] = (pio->io_stage >= ZIO_STAGE_READY) ||
 	    (pio->io_pipeline & ZIO_STAGE_READY) == 0;
 	pio->io_state[ZIO_WAIT_DONE] = (pio->io_stage >= ZIO_STAGE_DONE);
+
+	/*
+	 * It's possible for a failed ZIO to be a descendant of more than one
+	 * ZIO tree. When reexecuting it, we have to be sure to add its wait
+	 * states to all parent wait counts.
+	 *
+	 * Those parents, in turn, may have other children that are currently
+	 * active, usually because they've already been reexecuted after
+	 * resuming. Those children may be executing and may call
+	 * zio_notify_parent() at the same time as we're updating our parent's
+	 * counts. To avoid races while updating the counts, we take
+	 * gio->io_lock before each update.
+	 */
 	zio_link_t *zl = NULL;
 	while ((gio = zio_walk_parents(pio, &zl)) != NULL) {
+		mutex_enter(&gio->io_lock);
 		for (int w = 0; w < ZIO_WAIT_TYPES; w++) {
 			gio->io_children[pio->io_child_type][w] +=
 			    !pio->io_state[w];
 		}
+		mutex_exit(&gio->io_lock);
 	}
+
 	for (int c = 0; c < ZIO_CHILD_TYPES; c++)
 		pio->io_child_error[c] = 0;
 
@@ -2612,6 +2840,8 @@ zio_suspend(spa_t *spa, zio_t *zio, zio_suspend_reason_t reason)
 	}
 
 	mutex_exit(&spa->spa_suspend_lock);
+
+	txg_wait_kick(spa->spa_dsl_pool);
 }
 
 int
@@ -4037,6 +4267,7 @@ zio_dva_allocate(zio_t *zio)
 		mc = spa_preferred_class(spa, zio);
 		zio->io_metaslab_class = mc;
 	}
+	ZIOSTAT_BUMP(ziostat_total_allocations);
 
 	/*
 	 * Try allocating the block in the usual metaslab class.
@@ -4102,6 +4333,7 @@ zio_dva_allocate(zio_t *zio)
 			    error);
 		}
 
+		ZIOSTAT_BUMP(ziostat_alloc_class_fallbacks);
 		error = metaslab_alloc(spa, mc, zio->io_size, bp,
 		    zio->io_prop.zp_copies, zio->io_txg, NULL, flags,
 		    &zio->io_alloc_list, zio, zio->io_allocator);
@@ -4114,6 +4346,9 @@ zio_dva_allocate(zio_t *zio)
 			    spa_name(spa), zio, (u_longlong_t)zio->io_size,
 			    error);
 		}
+		ZIOSTAT_BUMP(ziostat_gang_writes);
+		if (flags & METASLAB_GANG_CHILD)
+			ZIOSTAT_BUMP(ziostat_gang_multilevel);
 		return (zio_write_gang_block(zio, mc));
 	}
 	if (error != 0) {
@@ -4205,6 +4440,7 @@ zio_alloc_zil(spa_t *spa, objset_t *os, uint64_t txg, blkptr_t *new_bp,
 	int flags = METASLAB_ZIL;
 	int allocator = (uint_t)cityhash1(os->os_dsl_dataset->ds_object)
 	    % spa->spa_alloc_count;
+	ZIOSTAT_BUMP(ziostat_total_allocations);
 	error = metaslab_alloc(spa, spa_log_class(spa), size, new_bp, 1,
 	    txg, NULL, flags, &io_alloc_list, NULL, allocator);
 	*slog = (error == 0);
@@ -4214,6 +4450,7 @@ zio_alloc_zil(spa_t *spa, objset_t *os, uint64_t txg, blkptr_t *new_bp,
 		    &io_alloc_list, NULL, allocator);
 	}
 	if (error != 0) {
+		ZIOSTAT_BUMP(ziostat_alloc_class_fallbacks);
 		error = metaslab_alloc(spa, spa_normal_class(spa), size,
 		    new_bp, 1, txg, NULL, flags,
 		    &io_alloc_list, NULL, allocator);
@@ -4406,16 +4643,6 @@ zio_vdev_io_start(zio_t *zio)
 	    zio->io_type == ZIO_TYPE_WRITE ||
 	    zio->io_type == ZIO_TYPE_TRIM)) {
 
-		if (zio_handle_device_injection(vd, zio, ENOSYS) != 0) {
-			/*
-			 * "no-op" injections return success, but do no actual
-			 * work. Just skip the remaining vdev stages.
-			 */
-			zio_vdev_io_bypass(zio);
-			zio_interrupt(zio);
-			return (NULL);
-		}
-
 		if ((zio = vdev_queue_io(zio)) == NULL)
 			return (NULL);
 
@@ -4425,6 +4652,15 @@ zio_vdev_io_start(zio_t *zio)
 			return (NULL);
 		}
 		zio->io_delay = gethrtime();
+
+		if (zio_handle_device_injection(vd, zio, ENOSYS) != 0) {
+			/*
+			 * "no-op" injections return success, but do no actual
+			 * work. Just return it.
+			 */
+			zio_delay_interrupt(zio);
+			return (NULL);
+		}
 	}
 
 	vd->vdev_ops->vdev_op_io_start(zio);

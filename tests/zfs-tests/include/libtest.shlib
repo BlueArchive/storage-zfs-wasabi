@@ -28,6 +28,7 @@
 # Copyright (c) 2017, Datto Inc. All rights reserved.
 # Copyright (c) 2017, Open-E Inc. All rights reserved.
 # Copyright (c) 2021, The FreeBSD Foundation.
+# Copyright (c) 2025, Klara, Inc.
 # Use is subject to license terms.
 #
 
@@ -36,6 +37,7 @@
 . ${STF_TOOLS}/include/logapi.shlib
 . ${STF_SUITE}/include/math.shlib
 . ${STF_SUITE}/include/blkdev.shlib
+
 
 # On AlmaLinux 9 we will see $PWD = '.' instead of the full path.  This causes
 # some tests to fail.  Fix it up here.
@@ -1109,6 +1111,16 @@ function get_pool_prop # property pool
 	zpool get -Hpo value "$prop" "$pool" || log_fail "zpool get $prop $pool"
 }
 
+# Get the specified vdev property in parsable format or fail
+function get_vdev_prop
+{
+	typeset prop="$1"
+	typeset pool="$2"
+	typeset vdev="$3"
+
+	zpool get -Hpo value "$prop" "$pool" "$vdev" || log_fail "zpool get $prop $pool $vdev"
+}
+
 # Return 0 if a pool exists; $? otherwise
 #
 # $1 - pool name
@@ -1586,6 +1598,7 @@ function create_pool #pool devs_list
 
 	if is_global_zone ; then
 		[[ -d /$pool ]] && rm -rf /$pool
+		echo zpool create -f $pool $@
 		log_must zpool create -f $pool $@
 	fi
 
@@ -1962,6 +1975,28 @@ function wait_vdev_state # pool disk state timeout
 
 		i=$((i+1))
 		sleep 1
+	done
+
+	return 1
+}
+
+#
+# Wait for vdev 'sit_out' property to be cleared.
+#
+# $1 pool name
+# $2 vdev name
+# $3 timeout
+#
+function wait_sit_out #pool vdev timeout
+{
+	typeset pool=${1:-$TESTPOOL}
+	typeset vdev="$2"
+	typeset timeout=${3:-300}
+	for (( timer = 0; timer < $timeout; timer++ )); do
+		if [ "$(get_vdev_prop sit_out "$pool" "$vdev")" = "off" ]; then
+			return 0
+		fi
+		sleep 1;
 	done
 
 	return 1
@@ -3662,41 +3697,6 @@ function ls_xattr # path
 	esac
 }
 
-function kstat # stat flags?
-{
-	typeset stat=$1
-	typeset flags=${2-"-n"}
-
-	case "$UNAME" in
-	FreeBSD)
-		sysctl $flags kstat.zfs.misc.$stat
-		;;
-	Linux)
-		cat "/proc/spl/kstat/zfs/$stat" 2>/dev/null
-		;;
-	*)
-		false
-		;;
-	esac
-}
-
-function get_arcstat # stat
-{
-	typeset stat=$1
-
-	case "$UNAME" in
-	FreeBSD)
-		kstat arcstats.$stat
-		;;
-	Linux)
-		kstat arcstats | awk "/$stat/"' { print $3 }'
-		;;
-	*)
-		false
-		;;
-	esac
-}
-
 function punch_hole # offset length file
 {
 	typeset offset=$1
@@ -3748,9 +3748,9 @@ function arcstat_quiescence # stat echo
 	fi
 
 	while $do_once || [ $stat1 -ne $stat2 ] || [ $stat2 -eq 0 ]; do
-		typeset stat1=$(get_arcstat $stat)
+		typeset stat1=$(kstat arcstats.$stat)
 		sleep 0.5
-		typeset stat2=$(get_arcstat $stat)
+		typeset stat2=$(kstat arcstats.$stat)
 		do_once=false
 	done
 
@@ -3916,3 +3916,5 @@ function pop_coredump_pattern
 		;;
 	esac
 }
+
+. ${STF_SUITE}/include/kstat.shlib

@@ -90,6 +90,7 @@
 #include <sys/zfeature.h>
 #include <sys/dsl_destroy.h>
 #include <sys/zvol.h>
+#include <sys/trace_zfs.h>
 
 #ifdef	_KERNEL
 #include <sys/fm/protocol.h>
@@ -209,6 +210,14 @@ static uint_t	zio_taskq_batch_tpq;		  /* threads per taskq */
 static const boolean_t	zio_taskq_sysdc = B_TRUE; /* use SDC scheduling class */
 static const uint_t	zio_taskq_basedc = 80;	  /* base duty cycle */
 #endif
+
+/*
+ * If enabled, try to find an unlocked IO taskq to dispatch an IO onto before
+ * falling back to waiting on a lock. This should only be enabled in
+ * conjunction with careful performance testing, and will likely require
+ * zio_taskq_read/zio_taskq_write to be adjusted as well.
+ */
+boolean_t	zio_taskq_trylock = B_FALSE;
 
 #ifdef HAVE_SPA_THREAD
 static const boolean_t spa_create_process = B_TRUE; /* no process => no sysdc */
@@ -1131,6 +1140,9 @@ spa_taskqs_init(spa_t *spa, zio_type_t t, zio_taskq_type_t q)
 	spa_taskqs_t *tqs = &spa->spa_zio_taskq[t][q];
 	uint_t cpus, flags = TASKQ_DYNAMIC;
 
+	tqs->stqs_type = q;
+	tqs->stqs_zio_type = t;
+
 	switch (mode) {
 	case ZTI_MODE_FIXED:
 		ASSERT3U(value, >, 0);
@@ -1554,17 +1566,21 @@ spa_taskq_write_param(ZFS_MODULE_PARAM_ARGS)
 /*
  * Dispatch a task to the appropriate taskq for the ZFS I/O type and priority.
  * Note that a type may have multiple discrete taskqs to avoid lock contention
- * on the taskq itself.
+ * on the taskq itself. In that case we try each one until it goes in, before
+ * falling back to waiting on a lock.
  */
 void
 spa_taskq_dispatch(spa_t *spa, zio_type_t t, zio_taskq_type_t q,
     task_func_t *func, zio_t *zio, boolean_t cutinline)
 {
 	spa_taskqs_t *tqs = &spa->spa_zio_taskq[t][q];
-	taskq_t *tq;
+	taskq_ent_t *ent = &zio->io_tqent;
+	uint_t flags = cutinline ? TQ_FRONT : 0;
 
 	ASSERT3P(tqs->stqs_taskq, !=, NULL);
 	ASSERT3U(tqs->stqs_count, !=, 0);
+	DTRACE_PROBE2(spa_taskqs_ent__dispatch,
+	    spa_taskqs_t *, tqs, taskq_ent_t *, ent);
 
 	/*
 	 * NB: We are assuming that the zio can only be dispatched
@@ -1572,19 +1588,34 @@ spa_taskq_dispatch(spa_t *spa, zio_type_t t, zio_taskq_type_t q,
 	 * to dispatch the zio to another taskq at the same time.
 	 */
 	ASSERT(zio);
-	ASSERT(taskq_empty_ent(&zio->io_tqent));
+	ASSERT(taskq_empty_ent(ent));
 
 	if (tqs->stqs_count == 1) {
-		tq = tqs->stqs_taskq[0];
-	} else if ((t == ZIO_TYPE_WRITE) && (q == ZIO_TASKQ_ISSUE) &&
-	    ZIO_HAS_ALLOCATOR(zio)) {
-		tq = tqs->stqs_taskq[zio->io_allocator % tqs->stqs_count];
-	} else {
-		tq = tqs->stqs_taskq[((uint64_t)gethrtime()) % tqs->stqs_count];
+		taskq_dispatch_ent(tqs->stqs_taskq[0], func, zio, flags, ent);
+		goto out;
 	}
 
-	taskq_dispatch_ent(tq, func, zio, cutinline ? TQ_FRONT : 0,
-	    &zio->io_tqent);
+	int select;
+	if ((t == ZIO_TYPE_WRITE) && (q == ZIO_TASKQ_ISSUE) &&
+	    ZIO_HAS_ALLOCATOR(zio)) {
+		select = zio->io_allocator % tqs->stqs_count;
+	} else {
+		select = ((uint64_t)gethrtime()) % tqs->stqs_count;
+	}
+	if (zio_taskq_trylock) {
+		for (int i = 0; i < tqs->stqs_count; i++) {
+			if (taskq_try_dispatch_ent(tqs->stqs_taskq[select],
+			    func, zio, flags, ent))
+				goto out;
+			select = (select+1) % tqs->stqs_count;
+		}
+	}
+
+	taskq_dispatch_ent(tqs->stqs_taskq[select], func, zio, flags, ent);
+
+out:
+	DTRACE_PROBE2(spa_taskqs_ent__dispatched,
+	    spa_taskqs_t *, tqs, taskq_ent_t *, ent);
 }
 
 static void
@@ -9696,9 +9727,17 @@ spa_sync_props(void *arg, dmu_tx_t *tx)
 			if (nvpair_type(elem) == DATA_TYPE_STRING) {
 				ASSERT(proptype == PROP_TYPE_STRING);
 				strval = fnvpair_value_string(elem);
-				VERIFY0(zap_update(mos,
-				    spa->spa_pool_props_object, propname,
-				    1, strlen(strval) + 1, strval, tx));
+				if (strlen(strval) == 0) {
+					/* remove the property if value == "" */
+					(void) zap_remove(mos,
+					    spa->spa_pool_props_object,
+					    propname, tx);
+				} else {
+					VERIFY0(zap_update(mos,
+					    spa->spa_pool_props_object,
+					    propname, 1, strlen(strval) + 1,
+					    strval, tx));
+				}
 				spa_history_log_internal(spa, "set", tx,
 				    "%s=%s", elemname, strval);
 			} else if (nvpair_type(elem) == DATA_TYPE_UINT64) {
@@ -11042,6 +11081,9 @@ ZFS_MODULE_PARAM(zfs_zio, zio_, taskq_batch_pct, UINT, ZMOD_RW,
 
 ZFS_MODULE_PARAM(zfs_zio, zio_, taskq_batch_tpq, UINT, ZMOD_RW,
 	"Number of threads per IO worker taskqueue");
+
+ZFS_MODULE_PARAM(zfs_zio, zio_, taskq_trylock, UINT, ZMOD_RD,
+	"Try to dispatch IO to an unlocked IO taskqueue before sleeping");
 
 ZFS_MODULE_PARAM(zfs, zfs_, max_missing_tvds, U64, ZMOD_RW,
 	"Allow importing pool with up to this number of missing top-level "
