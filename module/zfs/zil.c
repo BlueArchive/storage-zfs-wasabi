@@ -108,6 +108,10 @@ zil_stats_t zil_stats = {
 	{ "zil_itx_metaslab_normal_bytes",	KSTAT_DATA_UINT64 },
 	{ "zil_itx_metaslab_slog_count",	KSTAT_DATA_UINT64 },
 	{ "zil_itx_metaslab_slog_bytes",	KSTAT_DATA_UINT64 },
+	{ "zil_lwb_open_count",			KSTAT_DATA_UINT64 },
+	{ "zil_lwb_chain_count",		KSTAT_DATA_UINT64 },
+	{ "zil_lwb_chain_write_count",		KSTAT_DATA_UINT64 },
+	{ "zil_lwb_defer_flush_count",		KSTAT_DATA_UINT64 },
 };
 
 static kstat_t *zil_ksp;
@@ -131,6 +135,8 @@ int zil_nocacheflush = 0;
  * to limit potential SLOG device abuse by single active ZIL writer.
  */
 unsigned long zil_slog_bulk = 768 * 1024;
+
+unsigned long zil_lwb_chain_write_pct = 100;
 
 static kmem_cache_t *zil_lwb_cache;
 static kmem_cache_t *zil_zcw_cache;
@@ -561,6 +567,7 @@ zil_alloc_lwb(zilog_t *zilog, blkptr_t *bp, boolean_t slog, uint64_t txg,
 		lwb->lwb_nused = 0;
 		lwb->lwb_sz = BP_GET_LSIZE(bp) - sizeof (zil_chain_t);
 	}
+	lwb->lwb_can_defer = B_FALSE;
 
 	mutex_enter(&zilog->zl_lock);
 	list_insert_tail(&zilog->zl_lwb_list, lwb);
@@ -1556,7 +1563,7 @@ zil_lwb_write_done(zio_t *zio)
 	lwb_t *lwb = zio->io_private;
 	spa_t *spa = zio->io_spa;
 	zilog_t *zilog = lwb->lwb_zilog;
-	lwb_t *nlwb;
+	lwb_t *nlwb = NULL;
 	void *cookie;
 	avl_tree_t *vt, *t;
 	zio_vdev_trace_t *zvt, *nzvt, zvt_search;
@@ -1579,7 +1586,17 @@ zil_lwb_write_done(zio_t *zio)
 	lwb->lwb_state = LWB_STATE_WRITE_DONE;
 	lwb->lwb_write_zio = NULL;
 	lwb->lwb_fastwrite = FALSE;
-	nlwb = list_next(&zilog->zl_lwb_list, lwb);
+
+	/*
+	 * If the next lwb has attached its write zio as a parent of this one,
+	 * then we have the option of deferring our flushes to it instead of
+	 * issuing them here.
+	 */
+	if (lwb->lwb_can_defer) {
+		nlwb = list_next(&zilog->zl_lwb_list, lwb);
+		ASSERT(nlwb);
+		ASSERT3U(nlwb->lwb_state, <, LWB_STATE_WRITE_DONE);
+	}
 	mutex_exit(&zilog->zl_lock);
 
 	/* Flushes disabled, so skip everything */
@@ -1633,6 +1650,8 @@ zil_lwb_write_done(zio_t *zio)
 	}
 
 	if (defer) {
+		ZIL_STAT_BUMP(zil_lwb_defer_flush_count);
+
 		/*
 		 * If we're deferring, copy any remaining vdev nodes to the
 		 * next lwb. There might still be some here if a previous
@@ -1690,6 +1709,8 @@ zil_lwb_set_zio_dependency(zilog_t *zilog, lwb_t *lwb)
 		zio_add_child(lwb->lwb_root_zio,
 		    last_lwb_opened->lwb_root_zio);
 
+		ZIL_STAT_BUMP(zil_lwb_chain_count);
+
 		/*
 		 * If the previous lwb's write hasn't already completed,
 		 * we also want to order the completion of the lwb write
@@ -1713,13 +1734,25 @@ zil_lwb_set_zio_dependency(zilog_t *zilog, lwb_t *lwb)
 		 * vdevs are flushed in the lwb write zio's completion
 		 * handler, zil_lwb_write_done()).
 		 */
-		if (last_lwb_opened->lwb_state != LWB_STATE_WRITE_DONE) {
+		if (last_lwb_opened->lwb_state != LWB_STATE_WRITE_DONE && (
+		    zil_lwb_chain_write_pct == 100 ||
+		    (zil_lwb_chain_write_pct != 0 &&
+		     random_in_range(100) < zil_lwb_chain_write_pct))) {
 			ASSERT(last_lwb_opened->lwb_state == LWB_STATE_OPENED ||
 			    last_lwb_opened->lwb_state == LWB_STATE_ISSUED);
 
 			ASSERT3P(last_lwb_opened->lwb_write_zio, !=, NULL);
 			zio_add_child(lwb->lwb_write_zio,
 			    last_lwb_opened->lwb_write_zio);
+
+			ZIL_STAT_BUMP(zil_lwb_chain_write_count);
+
+			/*
+			 * Note that the previous lwb now has a parent that
+			 * will block on its completion, and so its safe to
+			 * defer flushes to it if necessary.
+			 */
+			last_lwb_opened->lwb_can_defer = B_TRUE;
 		}
 	}
 }
@@ -1775,6 +1808,7 @@ zil_lwb_write_open(zilog_t *zilog, lwb_t *lwb)
 		ASSERT3P(lwb->lwb_write_zio, !=, NULL);
 
 		lwb->lwb_state = LWB_STATE_OPENED;
+		ZIL_STAT_BUMP(zil_lwb_open_count);
 
 		zil_lwb_set_zio_dependency(zilog, lwb);
 		zilog->zl_last_lwb_opened = lwb;
@@ -4458,4 +4492,8 @@ ZFS_MODULE_PARAM(zfs_zil, zil_, slog_bulk, ULONG, ZMOD_RW,
 
 ZFS_MODULE_PARAM(zfs_zil, zil_, maxblocksize, INT, ZMOD_RW,
 	"Limit in bytes of ZIL log block size");
+
+ZFS_MODULE_PARAM(zfs_zil, zil_, lwb_chain_write_pct, ULONG, ZMOD_RW,
+	"When possible, percentage of LWB writes that will be chained to next");
+
 /* END CSTYLED */
