@@ -2040,7 +2040,7 @@ typedef struct status_cbdata {
 	int		cb_name_flags;
 	int		cb_namewidth;
 	boolean_t	cb_allpools;
-	boolean_t	cb_verbose;
+	int		cb_verbosity;
 	boolean_t	cb_literal;
 	boolean_t	cb_explain;
 	boolean_t	cb_first;
@@ -2634,7 +2634,7 @@ print_class_vdevs(zpool_handle_t *zhp, status_cbdata_t *cb, nvlist_t *nv,
 	nvlist_t **child;
 	boolean_t printed = B_FALSE;
 
-	assert(zhp != NULL || !cb->cb_verbose);
+	assert(zhp != NULL || cb->cb_verbosity == 0);
 
 	if (nvlist_lookup_nvlist_array(nv, ZPOOL_CONFIG_CHILDREN, &child,
 	    &children) != 0)
@@ -7987,14 +7987,15 @@ print_checkpoint_status(pool_checkpoint_stat_t *pcs)
 }
 
 static void
-print_error_log(zpool_handle_t *zhp)
+print_error_log(zpool_handle_t *zhp, int verbosity)
 {
 	nvlist_t *nverrlist = NULL;
 	nvpair_t *elem;
-	char *pathname;
+	char *pathname, *last_pathname = NULL;
 	size_t len = MAXPATHLEN * 2;
+	boolean_t started = B_FALSE;
 
-	if (zpool_get_errlog(zhp, &nverrlist) != 0)
+	if (zpool_get_errlog(zhp, &nverrlist, verbosity) != 0)
 		return;
 
 	(void) printf("errors: Permanent errors have been "
@@ -8012,9 +8013,65 @@ print_error_log(zpool_handle_t *zhp)
 		verify(nvlist_lookup_uint64(nv, ZPOOL_ERR_OBJECT,
 		    &obj) == 0);
 		zpool_obj_to_path(zhp, dsobj, obj, pathname, len);
-		(void) printf("%7s %s\n", "", pathname);
+		if (last_pathname == NULL ||
+		    0 != strncmp(pathname, last_pathname, len))
+		{
+			last_pathname = strdup(pathname);
+			if (started)
+				(void) printf("\n");
+			else
+				started = B_TRUE;
+			(void) printf("%7s %s ", "", pathname);
+		} else if (verbosity > 1) {
+			(void) printf(",");
+		}
+		if (verbosity > 1) {
+			uint64_t level, blkid, blkid_next, blkid_start;
+
+			blkid = fnvlist_lookup_uint64(nv, ZPOOL_ERR_BLKID);
+			blkid_start = blkid;
+			level = fnvlist_lookup_uint64(nv, ZPOOL_ERR_LEVEL);
+			(void) printf("L%lu=", level);
+			do {
+				uint64_t level_next;
+				uint64_t dsobj_next, obj_next;
+
+				elem = nvlist_next_nvpair(nverrlist, elem);
+				if (elem == NULL)
+				{
+					elem = nvlist_prev_nvpair(nverrlist,
+					    elem);
+					break;
+				}
+				nv = fnvpair_value_nvlist(elem);
+				dsobj_next = fnvlist_lookup_uint64(nv,
+				    ZPOOL_ERR_DATASET);
+				obj_next = fnvlist_lookup_uint64(nv,
+				    ZPOOL_ERR_OBJECT);
+				blkid_next = fnvlist_lookup_uint64(nv,
+				    ZPOOL_ERR_BLKID);
+				level_next = fnvlist_lookup_uint64(nv,
+				    ZPOOL_ERR_LEVEL);
+				if (dsobj != dsobj_next || obj != obj_next ||
+				    level != level_next ||
+				    blkid + 1 != blkid_next)
+				{
+					elem = nvlist_prev_nvpair(nverrlist,
+					    elem);
+					break;
+				}
+				blkid = blkid_next;
+			} while(1) ;
+
+			if (blkid > blkid_start)
+				(void) printf("%lu-%lu", blkid_start, blkid);
+			else
+				(void) printf("%lu", blkid);
+		}
 	}
+	(void) printf("\n");
 	free(pathname);
+	free(last_pathname);
 	nvlist_free(nverrlist);
 }
 
@@ -8588,8 +8645,8 @@ status_callback(zpool_handle_t *zhp, void *data)
 			 * precise count by fetching the entire log and
 			 * uniquifying the results.
 			 */
-			if (nerr > 0 && nerr < 100 && !cbp->cb_verbose &&
-			    zpool_get_errlog(zhp, &nverrlist) == 0) {
+			if (nerr > 0 && nerr < 100 && cbp->cb_verbosity == 0 &&
+			    zpool_get_errlog(zhp, &nverrlist, 0) == 0) {
 				nvpair_t *elem;
 
 				elem = NULL;
@@ -8606,12 +8663,12 @@ status_callback(zpool_handle_t *zhp, void *data)
 			if (nerr == 0)
 				(void) printf(gettext("errors: No known data "
 				    "errors\n"));
-			else if (!cbp->cb_verbose)
+			else if (cbp->cb_verbosity == 0)
 				(void) printf(gettext("errors: %llu data "
 				    "errors, use '-v' for a list\n"),
 				    (u_longlong_t)nerr);
 			else
-				print_error_log(zhp);
+				print_error_log(zhp, cbp->cb_verbosity);
 		}
 
 		if (cbp->cb_dedup_stats)
@@ -8699,7 +8756,7 @@ zpool_do_status(int argc, char **argv)
 			cb.cb_print_slow_ios = B_TRUE;
 			break;
 		case 'v':
-			cb.cb_verbose = B_TRUE;
+			cb.cb_verbosity++;
 			break;
 		case 'x':
 			cb.cb_explain = B_TRUE;
