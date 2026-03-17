@@ -35,6 +35,7 @@
 #include <sys/fs/zfs.h>
 #include <sys/zio.h>
 #include <linux/blkpg.h>
+#include <linux/kdev_t.h>
 #include <linux/msdos_fs.h>
 #include <linux/vfs_compat.h>
 #ifdef HAVE_LINUX_BLK_CGROUP_HEADER
@@ -80,6 +81,7 @@ typedef struct dio_request {
 	atomic_t		dr_ref;		/* References */
 	int			dr_error;	/* Bio error */
 	int			dr_bio_count;	/* Count of bio's */
+	pid_t			dr_submit_pid;	/* PID that submitted (for trace) */
 	struct bio		*dr_bio[0];	/* Attached bio's */
 } dio_request_t;
 
@@ -163,6 +165,17 @@ bdev_max_capacity(struct block_device *bdev, uint64_t wholedisk)
 	return (psize);
 }
 
+/* First parent in io_parent_list (e.g. RAID-Z parent for a column child). */
+static zio_t *
+vdev_disk_parent_zio(zio_t *z)
+{
+	zio_link_t *zl = NULL;
+
+	if (z == NULL)
+		return (NULL);
+	return (zio_walk_parents(z, &zl));
+}
+
 static void
 vdev_disk_error(zio_t *zio)
 {
@@ -171,9 +184,14 @@ vdev_disk_error(zio_t *zio)
 	 * handling IRQs coming from a misbehaving disk device; use printk()
 	 * which is safe from any context.
 	 */
-	printk(KERN_WARNING "zio pool=%s vdev=%s error=%d type=%d "
-	    "offset=%llu size=%llu flags=%llu\n", spa_name(zio->io_spa),
-	    zio->io_vd->vdev_path, zio->io_error, zio->io_type,
+	printk(KERN_ERR "DBG:: disk error zio=%p parent_zio=%p pool=%s vdev=%s "
+	    "error=%d type=%d offset=%llu size=%llu flags=%llu\n",
+	    zio,
+	    vdev_disk_parent_zio(zio),
+	    spa_name(zio->io_spa),
+	    (zio->io_vd != NULL && zio->io_vd->vdev_path != NULL) ?
+	    zio->io_vd->vdev_path : "NULL",
+	    zio->io_error, zio->io_type,
 	    (u_longlong_t)zio->io_offset, (u_longlong_t)zio->io_size,
 	    zio->io_flags);
 }
@@ -427,10 +445,21 @@ vdev_disk_dio_put(dio_request_t *dr)
 	return (rc);
 }
 
+static const char *
+vdev_disk_dbg_vdev_path(zio_t *zio)
+{
+	if (zio == NULL || zio->io_vd == NULL)
+		return ("NULL");
+	if (zio->io_vd->vdev_path == NULL)
+		return ("(null)");
+	return (zio->io_vd->vdev_path);
+}
+
 BIO_END_IO_PROTO(vdev_disk_physio_completion, bio, error)
 {
 	dio_request_t *dr = bio->bi_private;
 	int rc;
+	int errno_val;
 
 	if (dr->dr_error == 0) {
 #ifdef HAVE_1ARG_BIO_END_IO_T
@@ -441,6 +470,45 @@ BIO_END_IO_PROTO(vdev_disk_physio_completion, bio, error)
 		else if (!test_bit(BIO_UPTODATE, &bio->bi_flags))
 			dr->dr_error = EIO;
 #endif
+	}
+	errno_val = dr->dr_error;
+
+	if (bio_data_dir(bio) == WRITE) {
+		struct block_device *bdev = bio->bi_bdev;
+		zio_t *z = dr->dr_zio;
+		printk(KERN_ERR "DBG: ZFS vdev_disk WRITE completion bio=%p "
+		    "pid=%d LBA=%llu disk=%u:%u size=%u errno=%d "
+#ifdef HAVE_BIO_BI_STATUS
+		    "bi_status=%u "
+#else
+		    "bi_error=%d "
+#endif
+		    "zio=%p parent_zio=%p io_bio=%p io_offset=%llu io_size=%llu "
+		    "io_txg=%llu io_type=%d io_flags=%#llx vdev=%s%s\n",
+		    bio,
+		    dr->dr_submit_pid,
+		    (unsigned long long)BIO_BI_SECTOR(bio),
+		    (bdev ? MAJOR(bdev->bd_dev) : 0),
+		    (bdev ? MINOR(bdev->bd_dev) : 0),
+		    (unsigned int)BIO_BI_SIZE(bio),
+		    errno_val
+#ifdef HAVE_BIO_BI_STATUS
+		    , (unsigned int)bio->bi_status
+#else
+		    , (int)bio->bi_error
+#endif
+		    ,
+		    z,
+		    vdev_disk_parent_zio(z),
+		    (z != NULL ? z->io_bio : NULL),
+		    (unsigned long long)(z != NULL ? z->io_offset : 0),
+		    (unsigned long long)(z != NULL ? z->io_size : 0),
+		    (unsigned long long)(z != NULL ? z->io_txg : 0),
+		    (z != NULL ? (int)z->io_type : -1),
+		    (unsigned long long)(z != NULL ? z->io_flags : 0),
+		    vdev_disk_dbg_vdev_path(z),
+		    (z != NULL && (z->io_flags & ZIO_FLAG_IO_RETRY)) ?
+		    " RETRY" : "");
 	}
 
 	/* Drop reference acquired by __vdev_disk_physio */
@@ -643,6 +711,7 @@ retry:
 		bio_set_flags_failfast(bdev, &flags);
 
 	dr->dr_zio = zio;
+	dr->dr_submit_pid = current->pid;
 
 	/*
 	 * Since bio's can have up to BIO_MAX_PAGES=256 iovec's, each of which
@@ -714,8 +783,34 @@ retry:
 
 	/* Submit all bio's associated with this dio */
 	for (int i = 0; i < dr->dr_bio_count; i++) {
-		if (dr->dr_bio[i])
+		if (dr->dr_bio[i]) {
+			if (rw == WRITE) {
+				zio_t *z = dr->dr_zio;
+				printk(KERN_ERR "DBG: ZFS vdev_disk WRITE submit bio=%p "
+				    "pid=%d LBA=%llu disk=%u:%u size=%u "
+				    "zio=%p parent_zio=%p io_bio=%p io_offset=%llu "
+				    "io_size=%llu io_txg=%llu io_type=%d io_flags=%#llx "
+				    "vdev=%s%s\n",
+				    dr->dr_bio[i],
+				    (int)current->pid,
+				    (unsigned long long)BIO_BI_SECTOR(dr->dr_bio[i]),
+				    MAJOR(bdev->bd_dev),
+				    MINOR(bdev->bd_dev),
+				    (unsigned int)BIO_BI_SIZE(dr->dr_bio[i]),
+				    z,
+				    vdev_disk_parent_zio(z),
+				    (z != NULL ? z->io_bio : NULL),
+				    (unsigned long long)(z != NULL ? z->io_offset : 0),
+				    (unsigned long long)(z != NULL ? z->io_size : 0),
+				    (unsigned long long)(z != NULL ? z->io_txg : 0),
+				    (z != NULL ? (int)z->io_type : -1),
+				    (unsigned long long)(z != NULL ? z->io_flags : 0),
+				    vdev_disk_dbg_vdev_path(z),
+				    (z != NULL && (z->io_flags & ZIO_FLAG_IO_RETRY)) ?
+				    " RETRY" : "");
+			}
 			vdev_submit_bio(dr->dr_bio[i]);
+		}
 	}
 
 	if (dr->dr_bio_count > 1)
@@ -729,11 +824,42 @@ retry:
 BIO_END_IO_PROTO(vdev_disk_io_flush_completion, bio, error)
 {
 	zio_t *zio = bio->bi_private;
+	struct block_device *bdev = bio->bi_bdev;
 #ifdef HAVE_1ARG_BIO_END_IO_T
 	zio->io_error = BIO_END_IO_ERROR(bio);
 #else
 	zio->io_error = -error;
 #endif
+
+	printk(KERN_ERR "DBG: ZFS vdev_disk FLUSH completion bio=%p LBA=0 "
+	    "disk=%u:%u errno=%d "
+#ifdef HAVE_BIO_BI_STATUS
+	    "bi_status=%u "
+#else
+	    "bi_error=%d "
+#endif
+	    "zio=%p parent_zio=%p io_bio=%p io_offset=%llu io_size=%llu "
+	    "io_txg=%llu io_type=%d io_flags=%#llx vdev=%s%s\n",
+	    bio,
+	    (bdev ? MAJOR(bdev->bd_dev) : 0),
+	    (bdev ? MINOR(bdev->bd_dev) : 0),
+	    zio->io_error
+#ifdef HAVE_BIO_BI_STATUS
+	    , (unsigned int)bio->bi_status
+#else
+	    , (int)bio->bi_error
+#endif
+	    ,
+	    zio,
+	    vdev_disk_parent_zio(zio),
+	    zio->io_bio,
+	    (unsigned long long)zio->io_offset,
+	    (unsigned long long)zio->io_size,
+	    (unsigned long long)zio->io_txg,
+	    (int)zio->io_type,
+	    (unsigned long long)zio->io_flags,
+	    vdev_disk_dbg_vdev_path(zio),
+	    (zio->io_flags & ZIO_FLAG_IO_RETRY) ? " RETRY" : "");
 
 	if (zio->io_error && (zio->io_error == EOPNOTSUPP))
 		zio->io_vd->vdev_nowritecache = B_TRUE;
@@ -762,6 +888,23 @@ vdev_disk_io_flush(struct block_device *bdev, zio_t *zio)
 	bio->bi_end_io = vdev_disk_io_flush_completion;
 	bio->bi_private = zio;
 	bio_set_flush(bio);
+	printk(KERN_ERR "DBG: ZFS vdev_disk FLUSH submit bio=%p pid=%d LBA=0 "
+	    "disk=%u:%u zio=%p parent_zio=%p io_bio=%p io_offset=%llu "
+	    "io_size=%llu io_txg=%llu io_type=%d io_flags=%#llx vdev=%s%s\n",
+	    bio,
+	    (int)current->pid,
+	    MAJOR(bdev->bd_dev),
+	    MINOR(bdev->bd_dev),
+	    zio,
+	    vdev_disk_parent_zio(zio),
+	    zio->io_bio,
+	    (unsigned long long)zio->io_offset,
+	    (unsigned long long)zio->io_size,
+	    (unsigned long long)zio->io_txg,
+	    (int)zio->io_type,
+	    (unsigned long long)zio->io_flags,
+	    vdev_disk_dbg_vdev_path(zio),
+	    (zio->io_flags & ZIO_FLAG_IO_RETRY) ? " RETRY" : "");
 	vdev_submit_bio(bio);
 	invalidate_bdev(bdev);
 

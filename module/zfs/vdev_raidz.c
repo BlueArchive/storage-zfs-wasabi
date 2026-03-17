@@ -37,6 +37,10 @@
 #include <sys/vdev_raidz_impl.h>
 #include <sys/vdev_draid.h>
 
+#if defined(__KERNEL__) && defined(__linux__)
+#include <linux/kernel.h>
+#endif
+
 #ifdef ZFS_DEBUG
 #include <sys/vdev.h>	/* For vdev_xlate() in vdev_raidz_io_verify() */
 #endif
@@ -1531,16 +1535,26 @@ vdev_raidz_io_start_write(zio_t *zio, raidz_row_t *rr, uint64_t ashift)
 
 	for (int c = 0; c < rr->rr_cols; c++) {
 		raidz_col_t *rc = &rr->rr_col[c];
+		zio_t *czio;
+
 		if (rc->rc_size == 0)
 			continue;
 
 		/* Verify physical to logical translation */
 		vdev_raidz_io_verify(vd, rr, c);
 
-		zio_nowait(zio_vdev_child_io(zio, NULL,
+		czio = zio_vdev_child_io(zio, NULL,
 		    vd->vdev_child[rc->rc_devidx], rc->rc_offset,
 		    rc->rc_abd, rc->rc_size, zio->io_type, zio->io_priority,
-		    0, vdev_raidz_child_done, rc));
+		    0, vdev_raidz_child_done, rc);
+#if defined(__KERNEL__) && defined(__linux__)
+		printk(KERN_ERR "DBG: vdev_raidz_io_start_write parent_zio=%p "
+		    "child_zio=%p col=%d rc_devidx=%llu rc_off=%llu rc_sz=%llu\n",
+		    zio, czio, c, (unsigned long long)rc->rc_devidx,
+		    (unsigned long long)rc->rc_offset,
+		    (unsigned long long)rc->rc_size);
+#endif
+		zio_nowait(czio);
 	}
 
 	/*
@@ -1548,6 +1562,8 @@ vdev_raidz_io_start_write(zio_t *zio, raidz_row_t *rr, uint64_t ashift)
 	 * contiguity.
 	 */
 	for (c = rm->rm_skipstart, i = 0; i < rm->rm_nskip; c++, i++) {
+		zio_t *czio;
+
 		ASSERT(c <= rr->rr_scols);
 		if (c == rr->rr_scols)
 			c = 0;
@@ -1555,10 +1571,17 @@ vdev_raidz_io_start_write(zio_t *zio, raidz_row_t *rr, uint64_t ashift)
 		raidz_col_t *rc = &rr->rr_col[c];
 		vdev_t *cvd = vd->vdev_child[rc->rc_devidx];
 
-		zio_nowait(zio_vdev_child_io(zio, NULL, cvd,
+		czio = zio_vdev_child_io(zio, NULL, cvd,
 		    rc->rc_offset + rc->rc_size, NULL, 1ULL << ashift,
 		    zio->io_type, zio->io_priority,
-		    ZIO_FLAG_NODATA | ZIO_FLAG_OPTIONAL, NULL, NULL));
+		    ZIO_FLAG_NODATA | ZIO_FLAG_OPTIONAL, NULL, NULL);
+#if defined(__KERNEL__) && defined(__linux__)
+		printk(KERN_ERR "DBG: vdev_raidz_io_start_write parent_zio=%p "
+		    "child_zio=%p skip col=%d rc_off=%llu (optional)\n",
+		    zio, czio, c,
+		    (unsigned long long)(rc->rc_offset + rc->rc_size));
+#endif
+		zio_nowait(czio);
 	}
 }
 
@@ -2110,6 +2133,12 @@ vdev_raidz_io_done_write_impl(zio_t *zio, raidz_row_t *rr)
 		zio->io_error = zio_worst_error(zio->io_error,
 		    vdev_raidz_worst_error(rr));
 	}
+
+#if defined(__KERNEL__) && defined(__linux__)
+	printk(KERN_ERR "DBG: vdev_raidz_io_done_write_impl zio=%p "
+	    "total_errors=%d rr_firstdatacol=%d io_error=%d\n",
+	    zio, total_errors, rr->rr_firstdatacol, zio->io_error);
+#endif
 }
 
 static void
