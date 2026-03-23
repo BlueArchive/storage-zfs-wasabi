@@ -46,6 +46,10 @@
 #include <sys/uberblock_impl.h>
 #include <sys/dsl_scan.h>
 
+#if defined(__KERNEL__) && defined(__linux__)
+#include <linux/kernel.h>
+#endif
+
 #ifdef ZFS_DEBUG
 #include <sys/vdev.h>	/* For vdev_xlate() in vdev_raidz_io_verify() */
 #endif
@@ -2426,10 +2430,21 @@ vdev_raidz_io_start_write(zio_t *zio, raidz_row_t *rr)
 		    cvd->vdev_psize - VDEV_LABEL_END_SIZE);
 
 		ASSERT3P(rc->rc_abd, !=, NULL);
-		zio_nowait(zio_vdev_child_io(zio, NULL, cvd,
-		    rc->rc_offset, rc->rc_abd,
-		    abd_get_size(rc->rc_abd), zio->io_type,
-		    zio->io_priority, 0, vdev_raidz_child_done, rc));
+		{
+			zio_t *czio = zio_vdev_child_io(zio, NULL, cvd,
+			    rc->rc_offset, rc->rc_abd,
+			    abd_get_size(rc->rc_abd), zio->io_type,
+			    zio->io_priority, 0, vdev_raidz_child_done, rc);
+#if defined(__KERNEL__) && defined(__linux__)
+			printk(KERN_ERR "DBG: vdev_raidz_io_start_write "
+			    "parent_zio=%p child_zio=%p col=%d rc_devidx=%llu "
+			    "rc_off=%llu rc_sz=%llu\n",
+			    zio, czio, c, (unsigned long long)rc->rc_devidx,
+			    (unsigned long long)rc->rc_offset,
+			    (unsigned long long)abd_get_size(rc->rc_abd));
+#endif
+			zio_nowait(czio);
+		}
 
 		if (rc->rc_shadow_devidx != INT_MAX) {
 			vdev_t *cvd2 = vd->vdev_child[rc->rc_shadow_devidx];
@@ -2438,11 +2453,24 @@ vdev_raidz_io_start_write(zio_t *zio, raidz_row_t *rr)
 			    rc->rc_shadow_offset + abd_get_size(rc->rc_abd), <,
 			    cvd2->vdev_psize - VDEV_LABEL_END_SIZE);
 
-			zio_nowait(zio_vdev_child_io(zio, NULL, cvd2,
-			    rc->rc_shadow_offset, rc->rc_abd,
-			    abd_get_size(rc->rc_abd),
-			    zio->io_type, zio->io_priority, 0,
-			    vdev_raidz_shadow_child_done, rc));
+			{
+				zio_t *czio = zio_vdev_child_io(zio, NULL, cvd2,
+				    rc->rc_shadow_offset, rc->rc_abd,
+				    abd_get_size(rc->rc_abd),
+				    zio->io_type, zio->io_priority, 0,
+				    vdev_raidz_shadow_child_done, rc);
+#if defined(__KERNEL__) && defined(__linux__)
+				printk(KERN_ERR "DBG: vdev_raidz_io_start_write "
+				    "parent_zio=%p child_zio=%p shadow col=%d "
+				    "rc_devidx=%llu rc_off=%llu rc_sz=%llu\n",
+				    zio, czio, c,
+				    (unsigned long long)rc->rc_shadow_devidx,
+				    (unsigned long long)rc->rc_shadow_offset,
+				    (unsigned long long)abd_get_size(
+				    rc->rc_abd));
+#endif
+				zio_nowait(czio);
+			}
 		}
 	}
 }
@@ -2469,9 +2497,20 @@ raidz_start_skip_writes(zio_t *zio)
 		ASSERT3U(rc->rc_offset, <,
 		    cvd->vdev_psize - VDEV_LABEL_END_SIZE);
 
-		zio_nowait(zio_vdev_child_io(zio, NULL, cvd, rc->rc_offset,
-		    NULL, 1ULL << ashift, zio->io_type, zio->io_priority,
-		    ZIO_FLAG_NODATA | ZIO_FLAG_OPTIONAL, NULL, NULL));
+		{
+			zio_t *czio = zio_vdev_child_io(zio, NULL, cvd,
+			    rc->rc_offset,
+			    NULL, 1ULL << ashift, zio->io_type, zio->io_priority,
+			    ZIO_FLAG_NODATA | ZIO_FLAG_OPTIONAL, NULL, NULL);
+#if defined(__KERNEL__) && defined(__linux__)
+			printk(KERN_ERR "DBG: raidz_start_skip_writes "
+			    "parent_zio=%p child_zio=%p col=%d rc_off=%llu "
+			    "(optional)\n",
+			    zio, czio, c,
+			    (unsigned long long)rc->rc_offset);
+#endif
+			zio_nowait(czio);
+		}
 	}
 }
 
@@ -3541,6 +3580,14 @@ vdev_raidz_io_done_write_impl(zio_t *zio, raidz_row_t *rr)
 		zio->io_error = zio_worst_error(zio->io_error,
 		    vdev_raidz_worst_error(rr));
 	}
+
+#if defined(__KERNEL__) && defined(__linux__)
+	printk(KERN_ERR "DBG: vdev_raidz_io_done_write_impl zio=%p "
+	    "normal_errors=%d shadow_errors=%d rr_firstdatacol=%d "
+	    "io_error=%d\n",
+	    zio, normal_errors, shadow_errors, rr->rr_firstdatacol,
+	    zio->io_error);
+#endif
 }
 
 static void

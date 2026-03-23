@@ -46,6 +46,10 @@
 #include <sys/brt.h>
 #include <sys/ddt.h>
 #include <sys/blkptr.h>
+
+#if defined(__KERNEL__) && defined(__linux__)
+#include <linux/kernel.h>
+#endif
 #include <sys/zfeature.h>
 #include <sys/dsl_scan.h>
 #include <sys/metaslab_impl.h>
@@ -4696,6 +4700,11 @@ zio_vdev_io_done(zio_t *zio)
 	vdev_ops_t *ops = vd ? vd->vdev_ops : &vdev_mirror_ops;
 	boolean_t unexpected_error = B_FALSE;
 
+#if defined(__KERNEL__) && defined(__linux__)
+	printk(KERN_ERR "DBG: zio_vdev_io_done ENTER zio=%p io_error=%d\n",
+	    zio, zio->io_error);
+#endif
+
 	if (zio_wait_for_children(zio, ZIO_CHILD_VDEV_BIT, ZIO_WAIT_DONE)) {
 		return (NULL);
 	}
@@ -4797,7 +4806,23 @@ zio_vdev_io_assess(zio_t *zio)
 {
 	vdev_t *vd = zio->io_vd;
 
+#if defined(__KERNEL__) && defined(__linux__)
+	{
+		const char *vdstr = "NULL";
+
+		if (vd != NULL)
+			vdstr = vd->vdev_path != NULL ? vd->vdev_path : "(null)";
+		printk(KERN_ERR "DBG: zio_vdev_io_assess ENTER zio=%p io_error=%d "
+		    "vd=%s\n", zio, zio->io_error,
+		    vd == NULL ? "NULL" : vdstr);
+	}
+#endif
+
 	if (zio_wait_for_children(zio, ZIO_CHILD_VDEV_BIT, ZIO_WAIT_DONE)) {
+#if defined(__KERNEL__) && defined(__linux__)
+		printk(KERN_ERR "DBG: zio_vdev_io_assess EXIT(wait_children) "
+		    "zio=%p io_error=%d\n", zio, zio->io_error);
+#endif
 		return (NULL);
 	}
 
@@ -4833,6 +4858,10 @@ zio_vdev_io_assess(zio_t *zio)
 			ASSERT3U(zio->io_error, ==, EIO);
 		}
 		zio->io_pipeline = ZIO_INTERLOCK_PIPELINE;
+#if defined(__KERNEL__) && defined(__linux__)
+		printk(KERN_ERR "DBG: zio_vdev_io_assess EXIT(interlock_dio) "
+		    "zio=%p io_error=%d\n", zio, zio->io_error);
+#endif
 		return (zio);
 	}
 
@@ -4854,6 +4883,10 @@ zio_vdev_io_assess(zio_t *zio)
 		zio->io_stage = ZIO_STAGE_VDEV_IO_START >> 1;
 		zio_taskq_dispatch(zio, ZIO_TASKQ_ISSUE,
 		    zio_requeue_io_start_cut_in_line);
+#if defined(__KERNEL__) && defined(__linux__)
+		printk(KERN_ERR "DBG: zio_vdev_io_assess EXIT(retry) zio=%p "
+		    "io_error=%d RETRY\n", zio, zio->io_error);
+#endif
 		return (NULL);
 	}
 
@@ -4892,6 +4925,10 @@ zio_vdev_io_assess(zio_t *zio)
 	if (zio->io_error)
 		zio->io_pipeline = ZIO_INTERLOCK_PIPELINE;
 
+#if defined(__KERNEL__) && defined(__linux__)
+	printk(KERN_ERR "DBG: zio_vdev_io_assess EXIT zio=%p io_error=%d\n",
+	    zio, zio->io_error);
+#endif
 	return (zio);
 }
 
