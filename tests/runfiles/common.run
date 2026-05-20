@@ -169,8 +169,10 @@ tests = ['zdb_002_pos', 'zdb_003_pos', 'zdb_004_pos', 'zdb_005_pos',
     'zdb_006_pos', 'zdb_args_neg', 'zdb_args_pos',
     'zdb_block_size_histogram', 'zdb_checksum', 'zdb_decompress',
     'zdb_display_block', 'zdb_encrypted', 'zdb_label_checksum',
-    'zdb_object_range_neg', 'zdb_object_range_pos', 'zdb_objset_id',
-    'zdb_decompress_zstd', 'zdb_recover', 'zdb_recover_2', 'zdb_backup']
+    'zdb_file_layout_001', 'zdb_file_layout_002', 'zdb_file_layout_003',
+    'zdb_file_layout_neg', 'zdb_object_range_neg', 'zdb_object_range_pos',
+    'zdb_objset_id', 'zdb_decompress_zstd', 'zdb_recover', 'zdb_recover_2',
+    'zdb_backup']
 pre =
 post =
 tags = ['functional', 'cli_root', 'zdb']
@@ -543,8 +545,8 @@ tags = ['functional', 'cli_root', 'zpool_scrub']
 
 [tests/functional/cli_root/zpool_set]
 tests = ['zpool_set_001_pos', 'zpool_set_002_neg', 'zpool_set_003_neg',
-    'zpool_set_ashift', 'zpool_set_features', 'vdev_set_001_pos',
-    'user_property_001_pos', 'user_property_002_neg',
+    'zpool_set_ashift', 'zpool_set_features', 'zpool_set_inherit',
+    'vdev_set_001_pos', 'user_property_001_pos', 'user_property_002_neg',
     'zpool_set_clear_userprop']
 tags = ['functional', 'cli_root', 'zpool_set']
 
@@ -874,7 +876,7 @@ tags = ['functional', 'redacted_send']
 tests = ['raidz_001_neg', 'raidz_002_pos', 'raidz_expand_001_pos',
     'raidz_expand_002_pos', 'raidz_expand_003_neg', 'raidz_expand_003_pos',
     'raidz_expand_004_pos', 'raidz_expand_005_pos', 'raidz_expand_006_neg',
-    'raidz_expand_007_neg']
+    'raidz_expand_007_neg', 'raidz_zinject']
 tags = ['functional', 'raidz']
 timeout = 1200
 
