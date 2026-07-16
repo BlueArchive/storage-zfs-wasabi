@@ -718,9 +718,12 @@ usage(void)
 	    "\t\t[<poolname>[/<dataset | objset id>] [<object | range> ...]]\n"
 	    "\t%s -E [-A] word0:word1:...:word15\n"
 	    "\t%s -S [-AP] [-e [-V] [-p <path> ...]] [-U <cache>] "
-	    "<poolname>\n\n",
+	    "<poolname>\n"
+	    "\t%s -W [-K <key>] <dataset> <path>\n"
+	    "\t%s -W [-K <key>] -O <dataset> <object-id>\n\n",
 	    cmdname, cmdname, cmdname, cmdname, cmdname, cmdname, cmdname,
-	    cmdname, cmdname, cmdname, cmdname, cmdname, cmdname, cmdname);
+	    cmdname, cmdname, cmdname, cmdname, cmdname, cmdname, cmdname,
+	    cmdname, cmdname);
 
 	(void) fprintf(stderr, "    Dataset name must include at least one "
 	    "separator character '/' or '@'\n");
@@ -784,6 +787,9 @@ usage(void)
 	    "simulate dedup to measure effect\n");
 	(void) fprintf(stderr, "        -v --verbose                 "
 	    "verbose (applies to all others)\n");
+	(void) fprintf(stderr, "        -W --raw-object-md5          "
+	    "compute MD5 of an object by reading directly from DVA locations "
+	    "(bypasses ARC/dbuf cache)\n");
 	(void) fprintf(stderr, "        -y --livelist                "
 	    "perform livelist and metaslab validation on any livelists being "
 	    "deleted\n\n");
@@ -5570,6 +5576,440 @@ dump_backup(const char *pool, uint64_t objset_id, const char *flagstr)
 	}
 }
 
+/*
+ * Entry in the ordered list of level-0 blocks collected during phase 1.
+ * Holes and embedded-BP blocks are recorded alongside data blocks so that
+ * phase 2 can hash everything in the correct file order.
+ */
+typedef struct {
+	blkptr_t	zbe_bp;		/* for DATA and EMBEDDED blocks */
+	abd_t		*zbe_pabd;	/* physical ABD, allocated in phase 2 */
+	uint64_t	zbe_file_offset;/* byte offset within the file */
+	uint64_t	zbe_use;	/* number of bytes to hash */
+	boolean_t	zbe_is_hole;
+	boolean_t	zbe_is_embedded;
+} zdb_blk_entry_t;
+
+/*
+ * Context for raw on-disk MD5 computation.  Data blocks are read directly
+ * via zio_read() (bypassing the ARC) and fed into an OpenSSL EVP MD5 digest.
+ * Indirect (metadata) blocks are read via arc_read() for traversal only.
+ */
+typedef struct {
+	EVP_MD_CTX	*zmc_md5;
+	spa_t		*zmc_spa;
+	uint64_t	 zmc_file_size;	/* logical file size in bytes */
+	uint64_t	 zmc_blksize;	/* data block size in bytes */
+	uint64_t	 zmc_epb;	/* block pointers per indirect block */
+	int		 zmc_error;
+	/* Phase 1: ordered collection of level-0 entries */
+	zdb_blk_entry_t	*zmc_entries;
+	uint64_t	 zmc_nentries;
+	uint64_t	 zmc_entries_cap;
+} zdb_md5_ctx_t;
+
+static void
+zdb_md5_feed_zeros(zdb_md5_ctx_t *ctx, uint64_t size)
+{
+	static const uint8_t zeros[65536];
+
+	while (size > 0) {
+		uint64_t chunk = MIN(size, sizeof (zeros));
+		EVP_DigestUpdate(ctx->zmc_md5, zeros, (unsigned int)chunk);
+		size -= chunk;
+	}
+}
+
+/*
+ * Append one entry to the ordered block list, growing the array as needed.
+ */
+static void
+zdb_md5_append_entry(zdb_md5_ctx_t *ctx, const zdb_blk_entry_t *e)
+{
+	if (ctx->zmc_nentries == ctx->zmc_entries_cap) {
+		uint64_t newcap = (ctx->zmc_entries_cap == 0) ?
+		    64 : ctx->zmc_entries_cap * 2;
+		ctx->zmc_entries = realloc(ctx->zmc_entries,
+		    newcap * sizeof (zdb_blk_entry_t));
+		if (ctx->zmc_entries == NULL)
+			fatal("out of memory allocating block list");
+		ctx->zmc_entries_cap = newcap;
+	}
+	ctx->zmc_entries[ctx->zmc_nentries++] = *e;
+}
+
+/*
+ * Phase 1: walk the dnode block tree and append all level-0 entries
+ * (holes, embedded BPs, and data blocks) to ctx->zmc_entries in file order.
+ * All blocks — including indirect blocks — are read directly from disk via
+ * zio_read() with ZIO_FLAG_RAW, completely bypassing the ARC and dbuf layer.
+ * The caller must hold spa_config_enter(SCL_STATE) for the duration.
+ */
+static void
+zdb_md5_collect_bp(zdb_md5_ctx_t *ctx, const dnode_phys_t *dnp,
+    blkptr_t *bp, const zbookmark_phys_t *zb)
+{
+	if (ctx->zmc_error != 0)
+		return;
+
+	if (BP_GET_LOGICAL_BIRTH(bp) == 0) {
+		/* Hole: record the zero byte range. */
+		uint64_t nblocks = 1;
+		for (int l = 0; l < zb->zb_level; l++)
+			nblocks *= ctx->zmc_epb;
+		uint64_t start = zb->zb_blkid * nblocks * ctx->zmc_blksize;
+		if (start < ctx->zmc_file_size) {
+			zdb_blk_entry_t e = {
+				.zbe_file_offset = start,
+				.zbe_use = MIN(nblocks * ctx->zmc_blksize,
+				    ctx->zmc_file_size - start),
+				.zbe_is_hole = B_TRUE,
+			};
+			zdb_md5_append_entry(ctx, &e);
+		}
+		return;
+	}
+
+	if (BP_IS_EMBEDDED(bp)) {
+		if (BPE_GET_ETYPE(bp) != BP_EMBEDDED_TYPE_DATA)
+			return;
+		uint64_t lsize = BPE_GET_LSIZE(bp);
+		uint64_t start = zb->zb_blkid * ctx->zmc_blksize;
+		if (start < ctx->zmc_file_size) {
+			zdb_blk_entry_t e = {
+				.zbe_bp = *bp,
+				.zbe_file_offset = start,
+				.zbe_use = MIN(lsize,
+				    ctx->zmc_file_size - start),
+				.zbe_is_embedded = B_TRUE,
+			};
+			zdb_md5_append_entry(ctx, &e);
+		}
+		return;
+	}
+
+	if (zb->zb_level > 0) {
+		/*
+		 * Indirect block: read directly from disk via zio_read() to
+		 * avoid any ARC involvement, then recurse into children.
+		 */
+		uint64_t psize = BP_GET_PSIZE(bp);
+		uint64_t lsize = BP_GET_LSIZE(bp);
+		abd_t *pabd = abd_alloc_for_io(psize, B_FALSE);
+
+		zio_t *zio = zio_root(ctx->zmc_spa, NULL, NULL,
+		    ZIO_FLAG_CANFAIL);
+		zio_nowait(zio_read(zio, ctx->zmc_spa, bp, pabd, psize,
+		    NULL, NULL, ZIO_PRIORITY_SYNC_READ,
+		    ZIO_FLAG_CANFAIL | ZIO_FLAG_RAW, NULL));
+		int err = zio_wait(zio);
+
+		if (err != 0) {
+			(void) fprintf(stderr,
+			    "zio_read (indirect) failed: %d\n", err);
+			abd_free(pabd);
+			ctx->zmc_error = err;
+			return;
+		}
+
+		void *ibuf = umem_alloc(lsize, UMEM_NOFAIL);
+		if (BP_GET_COMPRESS(bp) != ZIO_COMPRESS_OFF) {
+			abd_t *dabd = abd_alloc_linear(lsize, B_TRUE);
+			err = zio_decompress_data(BP_GET_COMPRESS(bp),
+			    pabd, dabd, psize, lsize, NULL);
+			if (err == 0)
+				abd_copy_to_buf(ibuf, dabd, lsize);
+			abd_free(dabd);
+		} else {
+			abd_copy_to_buf(ibuf, pabd, lsize);
+		}
+		abd_free(pabd);
+
+		if (err != 0) {
+			(void) fprintf(stderr,
+			    "decompression of indirect block failed: %d\n",
+			    err);
+			umem_free(ibuf, lsize);
+			ctx->zmc_error = err;
+			return;
+		}
+
+		int epb = lsize >> SPA_BLKPTRSHIFT;
+		blkptr_t *cbp = ibuf;
+		for (int i = 0; i < epb; i++, cbp++) {
+			zbookmark_phys_t czb;
+			SET_BOOKMARK(&czb, zb->zb_objset, zb->zb_object,
+			    zb->zb_level - 1, zb->zb_blkid * epb + i);
+			zdb_md5_collect_bp(ctx, dnp, cbp, &czb);
+			if (ctx->zmc_error != 0)
+				break;
+		}
+		umem_free(ibuf, lsize);
+		return;
+	}
+
+	/* Level-0 data block: record for batch reading in phase 2. */
+	uint64_t blk_start = zb->zb_blkid * ctx->zmc_blksize;
+	if (blk_start >= ctx->zmc_file_size)
+		return;
+
+	zdb_blk_entry_t e = {
+		.zbe_bp = *bp,
+		.zbe_pabd = NULL,
+		.zbe_file_offset = blk_start,
+		.zbe_use = MIN(BP_GET_LSIZE(bp),
+		    ctx->zmc_file_size - blk_start),
+	};
+	zdb_md5_append_entry(ctx, &e);
+}
+
+/*
+ * Hash a single collected entry into the MD5 context.
+ * For DATA entries, zbe_pabd must already be populated by phase 2.
+ */
+static void
+zdb_md5_hash_entry(zdb_md5_ctx_t *ctx, zdb_blk_entry_t *e)
+{
+	if (e->zbe_is_hole) {
+		zdb_md5_feed_zeros(ctx, e->zbe_use);
+		return;
+	}
+
+	if (e->zbe_is_embedded) {
+		uint64_t lsize = BPE_GET_LSIZE(&e->zbe_bp);
+		void *buf = umem_alloc(lsize, UMEM_NOFAIL);
+		int err = decode_embedded_bp(&e->zbe_bp, buf, (int)lsize);
+		if (err == 0) {
+			EVP_DigestUpdate(ctx->zmc_md5, buf,
+			    (unsigned int)e->zbe_use);
+		} else {
+			(void) fprintf(stderr,
+			    "decode_embedded_bp failed: %d\n", err);
+			ctx->zmc_error = err;
+		}
+		umem_free(buf, lsize);
+		return;
+	}
+
+	/* DATA block: decompress if needed, then hash. */
+	ASSERT3P(e->zbe_pabd, !=, NULL);
+	uint64_t psize = BP_GET_PSIZE(&e->zbe_bp);
+	uint64_t lsize = BP_GET_LSIZE(&e->zbe_bp);
+
+	if (BP_GET_COMPRESS(&e->zbe_bp) != ZIO_COMPRESS_OFF) {
+		abd_t *dabd = abd_alloc_linear(lsize, B_TRUE);
+		int err = zio_decompress_data(BP_GET_COMPRESS(&e->zbe_bp),
+		    e->zbe_pabd, dabd, psize, lsize, NULL);
+		if (err == 0) {
+			EVP_DigestUpdate(ctx->zmc_md5, abd_to_buf(dabd),
+			    (unsigned int)e->zbe_use);
+		} else {
+			(void) fprintf(stderr,
+			    "decompression failed at offset %" PRIu64 ": %d\n",
+			    e->zbe_file_offset, err);
+			ctx->zmc_error = err;
+		}
+		abd_free(dabd);
+	} else {
+		void *lbuf = umem_alloc(SPA_MAXBLOCKSIZE, UMEM_NOFAIL);
+		abd_copy_to_buf(lbuf, e->zbe_pabd, lsize);
+		EVP_DigestUpdate(ctx->zmc_md5, lbuf, (unsigned int)e->zbe_use);
+		umem_free(lbuf, SPA_MAXBLOCKSIZE);
+	}
+}
+
+/*
+ * Phase 2: process the collected entries in windows of up to 'inflight'
+ * data blocks.  Within each window all reads are issued in parallel under
+ * a single root zio, then entries are hashed in file order.
+ * The caller must hold spa_config_enter(SCL_STATE) for the duration.
+ */
+static int
+zdb_md5_process_entries(zdb_md5_ctx_t *ctx)
+{
+	int inflight = dump_opt['I'] ? dump_opt['I'] : 200;
+	uint64_t i = 0;
+
+	while (i < ctx->zmc_nentries && ctx->zmc_error == 0) {
+		/*
+		 * Advance wend until we have accumulated 'inflight' data
+		 * blocks or exhausted the entry list.
+		 */
+		uint64_t wend = i;
+		int nreads = 0;
+		while (wend < ctx->zmc_nentries && nreads < inflight) {
+			zdb_blk_entry_t *e = &ctx->zmc_entries[wend];
+			if (!e->zbe_is_hole && !e->zbe_is_embedded)
+				nreads++;
+			wend++;
+		}
+
+		if (nreads > 0) {
+			/*
+			 * Issue all data reads in this window in parallel
+			 * under one root zio, then wait for all of them.
+			 */
+			zio_t *root = zio_root(ctx->zmc_spa, NULL, NULL,
+			    ZIO_FLAG_CANFAIL);
+
+			for (uint64_t j = i; j < wend; j++) {
+				zdb_blk_entry_t *e = &ctx->zmc_entries[j];
+				if (e->zbe_is_hole || e->zbe_is_embedded)
+					continue;
+				uint64_t psize = BP_GET_PSIZE(&e->zbe_bp);
+				e->zbe_pabd = abd_alloc_for_io(psize, B_FALSE);
+				zio_nowait(zio_read(root, ctx->zmc_spa,
+				    &e->zbe_bp, e->zbe_pabd, psize, NULL, NULL,
+				    ZIO_PRIORITY_ASYNC_READ,
+				    ZIO_FLAG_CANFAIL | ZIO_FLAG_RAW, NULL));
+			}
+
+			int error = zio_wait(root);
+			if (error != 0) {
+				(void) fprintf(stderr,
+				    "zio_read failed in window [%" PRIu64
+				    ", %" PRIu64 "]: %d\n", i, wend, error);
+				ctx->zmc_error = error;
+				for (uint64_t j = i; j < wend; j++) {
+					if (ctx->zmc_entries[j].zbe_pabd != NULL) {
+						abd_free(
+						    ctx->zmc_entries[j].zbe_pabd);
+						ctx->zmc_entries[j].zbe_pabd =
+						    NULL;
+					}
+				}
+				break;
+			}
+		}
+
+		/*
+		 * Hash entries in file order.  Always free any ABDs even if
+		 * a hash error is encountered mid-window.
+		 */
+		for (uint64_t j = i; j < wend; j++) {
+			zdb_blk_entry_t *e = &ctx->zmc_entries[j];
+			if (ctx->zmc_error == 0)
+				zdb_md5_hash_entry(ctx, e);
+			if (e->zbe_pabd != NULL) {
+				abd_free(e->zbe_pabd);
+				e->zbe_pabd = NULL;
+			}
+		}
+
+		i = wend;
+	}
+
+	return (ctx->zmc_error);
+}
+
+/*
+ * Compute the MD5 checksum of a ZFS object by reading all blocks —
+ * including indirect blocks — directly from the DVA locations on disk via
+ * zio_read() with ZIO_FLAG_RAW, completely bypassing the ARC and dbuf caches.
+ * The object is identified by its object number within the given objset.
+ */
+static int
+zdb_raw_object_md5(objset_t *os, uint64_t object)
+{
+	spa_t *spa = dmu_objset_spa(os);
+	dnode_t *dn;
+	int error;
+
+	error = dnode_hold(os, object, FTAG, &dn);
+	if (error != 0) {
+		(void) fprintf(stderr,
+		    "dnode_hold(%" PRIu64 ") failed: %d\n", object, error);
+		return (error);
+	}
+
+	dnode_phys_t *dnp = dn->dn_phys;
+	uint64_t blksize = (uint64_t)dnp->dn_datablkszsec << SPA_MINBLOCKSHIFT;
+
+	/* Obtain the logical file size from the ZFS SA layer if available. */
+	uint64_t file_size = 0;
+	if (sa_os == os && sa_attr_table != NULL) {
+		sa_handle_t *hdl;
+		if (sa_handle_get(os, object, NULL, SA_HDL_PRIVATE, &hdl) == 0) {
+			(void) sa_lookup(hdl, sa_attr_table[ZPL_SIZE],
+			    &file_size, sizeof (file_size));
+			sa_handle_destroy(hdl);
+		}
+	}
+	if (file_size == 0 && dnp->dn_maxblkid > 0)
+		file_size = (dnp->dn_maxblkid + 1) * blksize;
+
+	(void) printf("Object %" PRIu64 ": computing raw on-disk MD5 "
+	    "(%" PRIu64 " bytes)\n", object, file_size);
+
+	EVP_MD_CTX *md5_ctx = EVP_MD_CTX_new();
+	if (md5_ctx == NULL) {
+		dnode_rele(dn, FTAG);
+		return (ENOMEM);
+	}
+	(void) EVP_DigestInit_ex(md5_ctx, EVP_md5(), NULL);
+
+	if (file_size > 0) {
+		uint64_t epb = 1ULL <<
+		    (dnp->dn_indblkshift - SPA_BLKPTRSHIFT);
+		zdb_md5_ctx_t ctx = {
+			.zmc_md5 = md5_ctx,
+			.zmc_spa = spa,
+			.zmc_file_size = file_size,
+			.zmc_blksize = blksize,
+			.zmc_epb = epb,
+			.zmc_error = 0,
+			.zmc_entries = NULL,
+			.zmc_nentries = 0,
+			.zmc_entries_cap = 0,
+		};
+
+		/*
+		 * Hold the spa config lock across both phases so that the
+		 * vdev tree is stable for all zio_read() calls.
+		 */
+		spa_config_enter(spa, SCL_STATE, FTAG, RW_READER);
+
+		/* Phase 1: walk the block tree, collect L0 entries. */
+		zbookmark_phys_t czb;
+		SET_BOOKMARK(&czb, dmu_objset_id(os), object,
+		    dnp->dn_nlevels - 1, 0);
+		for (int j = 0; j < dnp->dn_nblkptr; j++) {
+			czb.zb_blkid = j;
+			zdb_md5_collect_bp(&ctx, dnp,
+			    &dnp->dn_blkptr[j], &czb);
+			if (ctx.zmc_error != 0)
+				break;
+		}
+
+		/* Phase 2: batch-read data blocks, hash all entries in order. */
+		if (ctx.zmc_error == 0)
+			error = zdb_md5_process_entries(&ctx);
+		else
+			error = ctx.zmc_error;
+
+		spa_config_exit(spa, SCL_STATE, FTAG);
+
+		free(ctx.zmc_entries);
+	}
+
+	if (error == 0) {
+		unsigned char digest[EVP_MAX_MD_SIZE];
+		unsigned int digest_len = 0;
+		(void) EVP_DigestFinal_ex(md5_ctx, digest, &digest_len);
+		(void) printf("MD5 (object %" PRIu64 ") = ", object);
+		for (unsigned int i = 0; i < digest_len; i++)
+			(void) printf("%02x", digest[i]);
+		(void) printf("\n");
+	} else {
+		(void) fprintf(stderr,
+		    "Failed to compute raw MD5: error %d\n", error);
+	}
+
+	EVP_MD_CTX_free(md5_ctx);
+	dnode_rele(dn, FTAG);
+	return (error);
+}
+
 static int
 zdb_copy_object(objset_t *os, uint64_t srcobj, char *destfile)
 {
@@ -9675,11 +10115,12 @@ main(int argc, char **argv)
 		{"all-reconstruction",	no_argument,		NULL, 'Y'},
 		{"livelist",		no_argument,		NULL, 'y'},
 		{"zstd-headers",	no_argument,		NULL, 'Z'},
+		{"raw-object-md5",	no_argument,		NULL, 'W'},
 		{0, 0, 0, 0}
 	};
 
 	while ((c = getopt_long(argc, argv,
-	    "AbBcCdDeEfFGhHiI:kK:lLmMNo:Op:PqrRsSt:TuU:vVx:XYyZ",
+	    "AbBcCdDeEfFGhHiI:kK:lLmMNo:Op:PqrRsSt:TuU:vVWx:XYyZ",
 	    long_options, NULL)) != -1) {
 		switch (c) {
 		case 'b':
@@ -9704,6 +10145,7 @@ main(int argc, char **argv)
 		case 'S':
 		case 'T':
 		case 'u':
+		case 'W':
 		case 'y':
 		case 'Z':
 			dump_opt[c]++;
@@ -10035,7 +10477,7 @@ main(int argc, char **argv)
 	 * which imports the pool to the namespace if it's
 	 * not in the cachefile.
 	 */
-	if (dump_opt['O'] && !dump_opt['r']) {
+	if (dump_opt['O'] && !dump_opt['r'] && !dump_opt['W']) {
 		if (argc != 2)
 			usage();
 		dump_opt['v'] = verbose + 3;
@@ -10055,6 +10497,21 @@ main(int argc, char **argv)
 		}
 		if (error != 0)
 			fatal("internal error: %s", strerror(error));
+	}
+
+	if (dump_opt['W']) {
+		target_is_spa = B_FALSE;
+		if (dump_opt['O']) {
+			if (argc != 2)
+				usage();
+			object = strtoull(argv[1], NULL, 0);
+		} else {
+			if (argc != 2)
+				usage();
+			error = dump_path(argv[0], argv[1], &object);
+			if (error != 0)
+				fatal("internal error: %s", strerror(error));
+		}
 	}
 
 	/*
@@ -10199,6 +10656,8 @@ retry_lookup:
 	argc--;
 	if (dump_opt['r']) {
 		error = zdb_copy_object(os, object, argv[1]);
+	} else if (dump_opt['W']) {
+		error = zdb_raw_object_md5(os, object);
 	} else if (!dump_opt['R']) {
 		flagbits['d'] = ZOR_FLAG_DIRECTORY;
 		flagbits['f'] = ZOR_FLAG_PLAIN_FILE;
@@ -10285,3 +10744,54 @@ fini:
 
 	return (error);
 }
+
+/*
+ * The -W flag: Raw L0 Block Reading
+
+  This is the most substantial addition. It computes MD5 over a ZFS object's data by reading every block directly off disk via zio_read() with ZIO_FLAG_RAW, completely bypassing the ARC and
+  dbuf caches. This is useful for validating what is actually stored on disk vs. what the ARC may be serving.
+
+  Entry point: zdb_raw_object_md5() (cmd/zdb/zdb.c)
+
+  The implementation is split into two phases:
+
+  Phase 1 — Block Tree Walk: zdb_md5_collect_bp()
+
+  Recursively walks the dnode block tree top-down. For each block pointer:
+
+  - Birth txg == 0 (hole): Records a zero-byte range in the entry list. No I/O is done.
+  - Embedded BP: Records it as an embedded entry. The data is decoded in place later (no I/O).
+  - Indirect block (level > 0): Reads it directly from disk with zio_read(..., ZIO_FLAG_RAW) — no ARC. Decompresses if needed, then recurses into the child block pointers.
+  - L0 data block (level == 0): Does not read it yet. Just appends a zdb_blk_entry_t (containing the blkptr_t and file offset) to a dynamic array zmc_entries. This defers the actual I/O to
+  Phase 2.
+
+  zdb_md5_collect_bp()
+    ├─ hole      → append hole entry (no I/O)
+    ├─ embedded  → append embedded entry (no I/O)
+    ├─ level > 0 → zio_read() RAW, decompress, recurse children
+    └─ level 0   → append data entry to zmc_entries[] (deferred I/O)
+
+  Phase 2 — Parallel I/O + Hashing: zdb_md5_process_entries()
+
+  Processes the flat zmc_entries[] array collected in Phase 1:
+
+  1. Slices the entry list into windows of up to inflight (default 200) data blocks.
+  2. For each window: issues all data block reads in parallel under a single root zio using zio_read(..., ZIO_FLAG_CANFAIL | ZIO_FLAG_RAW), then calls zio_wait() to wait for all of them.
+  3. Once reads complete: iterates entries in file order and calls zdb_md5_hash_entry() on each, which:
+    - Feeds zeros for holes.
+    - Decodes embedded BPs with decode_embedded_bp().
+    - Decompresses data blocks (if compressed), then feeds them into the OpenSSL EVP_MD_CTX MD5 digest.
+  4. Frees each ABD immediately after hashing to bound memory use.
+
+  zdb_md5_process_entries()
+    for each window of ≤200 data blocks:
+      ├─ issue all zio_read() calls in parallel (ZIO_FLAG_RAW)
+      ├─ zio_wait() — wait for all reads
+      └─ for each entry in file order:
+           zdb_md5_hash_entry() → decompress → EVP_DigestUpdate()
+
+  The spa_config_enter(SCL_STATE) lock is held across both phases to keep the vdev tree stable for all zio_read() calls.
+
+  ---
+ *
+ *
