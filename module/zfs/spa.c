@@ -2247,6 +2247,38 @@ spa_should_sync_time_logger_on_unload(spa_t *spa)
 	return (B_TRUE);
 }
 
+/*
+ * Stop all write activity for the pool.
+ */
+static void
+spa_quiesce_writes(spa_t *spa)
+{
+	if (spa->spa_root_vdev != NULL) {
+		vdev_initialize_stop_all(spa->spa_root_vdev,
+		    VDEV_INITIALIZE_ACTIVE);
+		vdev_trim_stop_all(spa->spa_root_vdev, VDEV_TRIM_ACTIVE);
+		vdev_autotrim_stop_all(spa);
+		vdev_rebuild_stop_all(spa);
+		l2arc_spa_rebuild_stop(spa);
+	}
+
+	if (spa->spa_final_txg == UINT64_MAX) {
+		spa_config_enter(spa, SCL_ALL, FTAG, RW_WRITER);
+		spa->spa_final_txg = spa_last_synced_txg(spa) +
+		    TXG_DEFER_SIZE + 1;
+		spa_config_exit(spa, SCL_ALL, FTAG);
+	}
+
+	if (spa->spa_sync_on) {
+		txg_sync_stop(spa->spa_dsl_pool);
+		spa->spa_sync_on = B_FALSE;
+	}
+
+	if (spa->spa_mmp.mmp_thread)
+		mmp_thread_stop(spa);
+
+	spa_destroy_aux_threads(spa);
+}
 
 /*
  * Opposite of spa_load().
@@ -2511,39 +2543,6 @@ spa_load_spares(spa_t *spa)
 	for (i = 0; i < spa->spa_spares.sav_count; i++)
 		nvlist_free(spares[i]);
 	kmem_free(spares, spa->spa_spares.sav_count * sizeof (void *));
-}
-
-/*
- * Stop all write activity for the pool.
- */
-static void
-spa_quiesce_writes(spa_t *spa)
-{
-	if (spa->spa_root_vdev != NULL) {
-		vdev_initialize_stop_all(spa->spa_root_vdev,
-		    VDEV_INITIALIZE_ACTIVE);
-		vdev_trim_stop_all(spa->spa_root_vdev, VDEV_TRIM_ACTIVE);
-		vdev_autotrim_stop_all(spa);
-		vdev_rebuild_stop_all(spa);
-		l2arc_spa_rebuild_stop(spa);
-	}
-
-	if (spa->spa_final_txg == UINT64_MAX) {
-		spa_config_enter(spa, SCL_ALL, FTAG, RW_WRITER);
-		spa->spa_final_txg = spa_last_synced_txg(spa) +
-		    TXG_DEFER_SIZE + 1;
-		spa_config_exit(spa, SCL_ALL, FTAG);
-	}
-
-	if (spa->spa_sync_on) {
-		txg_sync_stop(spa->spa_dsl_pool);
-		spa->spa_sync_on = B_FALSE;
-	}
-
-	if (spa->spa_mmp.mmp_thread)
-		mmp_thread_stop(spa);
-
-	spa_destroy_aux_threads(spa);
 }
 
 /*
@@ -7607,20 +7606,20 @@ spa_make_readonly(spa_t *spa)
 		return (SET_ERROR(EBUSY));
 
 	/* pretend we're exporting the pool */
-	spa_namespace_enter(FTAG);
+	mutex_enter(&spa_namespace_lock);
 	if (spa->spa_is_exporting) {
-		spa_namespace_exit(FTAG);
+		mutex_exit(&spa_namespace_lock);
 		return (SET_ERROR(ZFS_ERR_EXPORT_IN_PROGRESS));
 	}
 
 	/* validate spa state again, inside the namespace lock this time */
 	if (spa_make_readonly_blocked(spa, B_TRUE)) {
-		spa_namespace_exit(FTAG);
+		mutex_exit(&spa_namespace_lock);
 		return (SET_ERROR(EBUSY));
 	}
 	spa->spa_is_exporting = B_TRUE;
 	spa->spa_export_thread = curthread;
-	spa_namespace_exit(FTAG);
+	mutex_exit(&spa_namespace_lock);
 
 	spa_async_suspend(spa);
 
@@ -7701,11 +7700,11 @@ out:
 
 	spa_evicting_os_wait(spa);
 
-	spa_namespace_enter(FTAG);
+	mutex_enter(&spa_namespace_lock);
 	spa->spa_is_exporting = B_FALSE;
 	spa->spa_export_thread = NULL;
-	spa_namespace_broadcast();
-	spa_namespace_exit(FTAG);
+	cv_broadcast(&spa_namespace_cv);
+	mutex_exit(&spa_namespace_lock);
 
 	return (error);
 }
