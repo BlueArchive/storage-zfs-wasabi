@@ -48,6 +48,7 @@
 #include <sys/zfs_sysfs.h>
 #include <sys/vdev_disk.h>
 #include <sys/types.h>
+#include <sys/mntent.h>
 #include <dlfcn.h>
 #include <libzutil.h>
 #include <fcntl.h>
@@ -857,10 +858,22 @@ zpool_valid_proplist(libzfs_handle_t *hdl, const char *poolname,
 			}
 			break;
 		case ZPOOL_PROP_READONLY:
-			if (!flags.import) {
+			if (flags.create) {
 				zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
-				    "property '%s' can only be set at "
-				    "import time"), propname);
+				    "property '%s' cannot be set at "
+				    "creation time"), propname);
+				(void) zfs_error(hdl, EZFS_BADPROP, errbuf);
+				goto error;
+			}
+			/*
+			 * If we're importing, we can set it 'on' or 'off'.
+			 * Once it's imported, only off->on is supported
+			 * for now.
+			 */
+			if (!flags.import && intval == 0) {
+				zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
+				    "property '%s' can only be set to "
+				    "'on'"), propname);
 				(void) zfs_error(hdl, EZFS_BADPROP, errbuf);
 				goto error;
 			}
@@ -889,6 +902,73 @@ error:
 	return (NULL);
 }
 
+static void
+undo_make_readonly(libzfs_handle_t *hdl, nvlist_t *list)
+{
+	const char *remount_opts = MNTOPT_REMOUNT "," MNTOPT_RW;
+	nvpair_t *elem = NULL;
+
+	while ((elem = nvlist_next_nvpair(list, elem)) != NULL) {
+		zfs_handle_t *zhp = zfs_open(hdl, nvpair_name(elem),
+		    ZFS_TYPE_FILESYSTEM);
+
+		/* should never happen? */
+		if (zhp == NULL)
+			continue;
+		(void) zfs_mount(zhp, remount_opts, 0);
+		zfs_close(zhp);
+	}
+}
+
+static int
+make_one_readonly(zfs_handle_t *zhp, void *ptr)
+{
+	nvlist_t *ro_fs_list = ptr;
+	const char *remount_opts = MNTOPT_REMOUNT "," MNTOPT_RO;
+	int err = 0;
+
+	/* only remount if it's mounted rw */
+	if (zfs_is_mounted(zhp, NULL) &&
+	    zfs_prop_get_int(zhp, ZFS_PROP_READONLY) == 0) {
+		if ((err = zfs_mount(zhp, remount_opts, 0)) == 0)
+			fnvlist_add_boolean(ro_fs_list, zfs_get_name(zhp));
+	}
+	zfs_close(zhp);
+
+	return (err);
+}
+
+static nvlist_t *
+make_datasets_readonly(zpool_handle_t *zhp)
+{
+	libzfs_handle_t *hdl = zhp->zpool_hdl;
+	nvlist_t *ro_fs_list;
+	zfs_handle_t *zfp;
+
+	if ((zfp = zfs_open(zhp->zpool_hdl, zhp->zpool_name,
+	    ZFS_TYPE_FILESYSTEM)) == NULL)
+		return (NULL);
+
+	ro_fs_list = fnvlist_alloc();
+
+	if (zfs_iter_mounted(zfp, make_one_readonly, ro_fs_list) != 0) {
+		zfs_close(zfp);
+		goto err_out;
+	}
+
+	if (make_one_readonly(zfp, ro_fs_list) != 0)
+		goto err_out;
+
+	return (ro_fs_list);
+
+err_out:
+
+	undo_make_readonly(hdl, ro_fs_list);
+	nvlist_free(ro_fs_list);
+
+	return (NULL);
+}
+
 /*
  * Set zpool property : propname=propval.
  */
@@ -899,7 +979,8 @@ zpool_set_prop(zpool_handle_t *zhp, const char *propname, const char *propval)
 	int ret = -1;
 	char errbuf[ERRBUFLEN];
 	nvlist_t *nvl = NULL;
-	nvlist_t *realprops;
+	nvlist_t *realprops, *remounted_fs = NULL;
+	boolean_t making_pool_readonly;
 	uint64_t version;
 	prop_flags_t flags = { 0 };
 
@@ -922,6 +1003,22 @@ zpool_set_prop(zpool_handle_t *zhp, const char *propname, const char *propval)
 		return (-1);
 	}
 
+	/*
+	 * If we're turning on READONLY, then help out by remounting
+	 * filesystems. For zvols, you're on your own.
+	 */
+	making_pool_readonly =
+	    (zpool_name_to_prop(propname) == ZPOOL_PROP_READONLY) &&
+	    (strcmp(propval, "on") == 0) &&
+	    (zpool_get_prop_int(zhp, ZPOOL_PROP_READONLY, NULL) == 0);
+
+	if (making_pool_readonly &&
+	    ((remounted_fs = make_datasets_readonly(zhp)) == NULL)) {
+		nvlist_free(realprops);
+		nvlist_free(nvl);
+		return (-1);
+	}
+
 	nvlist_free(nvl);
 	nvl = realprops;
 
@@ -937,10 +1034,21 @@ zpool_set_prop(zpool_handle_t *zhp, const char *propname, const char *propval)
 	zcmd_free_nvlists(&zc);
 	nvlist_free(nvl);
 
-	if (ret)
+	if (ret) {
+		if (making_pool_readonly) {
+			ASSERT3P(remounted_fs, !=, NULL);
+
+			int saved_errno = errno;
+			undo_make_readonly(zhp->zpool_hdl, remounted_fs);
+			errno = saved_errno;
+		}
 		(void) zpool_standard_error(zhp->zpool_hdl, errno, errbuf);
-	else
+	} else {
 		(void) zpool_props_refresh(zhp);
+	}
+
+	if (remounted_fs != NULL)
+		nvlist_free(remounted_fs);
 
 	return (ret);
 }
