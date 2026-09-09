@@ -99,6 +99,9 @@
 #include <sys/callb.h>
 #include <sys/zone.h>
 #include <sys/vmsystm.h>
+#include <sys/zfs_vfsops.h>
+#include <sys/zfs_ioctl_impl.h>
+#include <sys/zvol_impl.h>
 #endif	/* _KERNEL */
 
 #include "zfs_crrd.h"
@@ -131,6 +134,15 @@
  * should be retried.
  */
 int zfs_ccw_retry_interval = 300;
+
+#ifndef	_KERNEL
+/*
+ * This global is used in ztest to allow the ztest_readonly() function
+ * to verify each site that spa_make_readonly_blocked() is called. There
+ * are currently 4. If this changes, update the #define in ztest.c
+ */
+int spa_simulate_writable_mounts = 0;
+#endif
 
 typedef enum zti_modes {
 	ZTI_MODE_FIXED,			/* value is # of threads (min 1) */
@@ -855,6 +867,12 @@ spa_prop_validate(spa_t *spa, nvlist_t *props)
 			}
 			break;
 
+		case ZPOOL_PROP_READONLY:
+			error = nvpair_value_uint64(elem, &intval);
+			if (!error && intval > 1)
+				error = SET_ERROR(EINVAL);
+			break;
+
 		case ZPOOL_PROP_CACHEFILE:
 			if ((error = nvpair_value_string(elem, &strval)) != 0)
 				break;
@@ -946,6 +964,8 @@ spa_prop_set(spa_t *spa, nvlist_t *nvp)
 	int error;
 	nvpair_t *elem = NULL;
 	boolean_t need_sync = B_FALSE;
+	boolean_t make_readonly = B_FALSE;
+	boolean_t make_rw = B_FALSE;
 
 	if ((error = spa_prop_validate(spa, nvp)) != 0)
 		return (error);
@@ -953,9 +973,19 @@ spa_prop_set(spa_t *spa, nvlist_t *nvp)
 	while ((elem = nvlist_next_nvpair(nvp, elem)) != NULL) {
 		zpool_prop_t prop = zpool_name_to_prop(nvpair_name(elem));
 
+		if (prop == ZPOOL_PROP_READONLY) {
+			uint64_t intval;
+
+			VERIFY0(nvpair_value_uint64(elem, &intval));
+			if (intval)
+				make_readonly = B_TRUE;
+			else
+				make_rw = B_TRUE;
+			continue;
+		}
+
 		if (prop == ZPOOL_PROP_CACHEFILE ||
-		    prop == ZPOOL_PROP_ALTROOT ||
-		    prop == ZPOOL_PROP_READONLY)
+		    prop == ZPOOL_PROP_ALTROOT)
 			continue;
 
 		if (prop == ZPOOL_PROP_INVAL &&
@@ -998,11 +1028,21 @@ spa_prop_set(spa_t *spa, nvlist_t *nvp)
 	}
 
 	if (need_sync) {
-		return (dsl_sync_task(spa->spa_name, NULL, spa_sync_props,
-		    nvp, 6, ZFS_SPACE_CHECK_RESERVED));
+		error = dsl_sync_task(spa->spa_name, NULL, spa_sync_props,
+		    nvp, 6, ZFS_SPACE_CHECK_RESERVED);
+		if (error)
+			return (error);
 	}
 
-	return (0);
+	if (make_readonly && spa_writeable(spa))
+		error = spa_make_readonly(spa);
+
+	if (make_rw && !spa_writeable(spa)) {
+		spa->spa_load_thread = curthread;
+		error = spa_make_writeable(spa);
+	}
+
+	return (error);
 }
 
 /*
@@ -1748,6 +1788,7 @@ spa_activate(spa_t *spa, spa_mode_t mode)
 	ASSERT(spa->spa_state == POOL_STATE_UNINITIALIZED);
 
 	spa->spa_state = POOL_STATE_ACTIVE;
+	spa->spa_final_txg = UINT64_MAX;
 	spa->spa_mode = mode;
 	spa->spa_read_spacemaps = spa_mode_readable_spacemaps;
 
@@ -2211,6 +2252,38 @@ spa_should_sync_time_logger_on_unload(spa_t *spa)
 	return (B_TRUE);
 }
 
+/*
+ * Stop all write activity for the pool.
+ */
+static void
+spa_quiesce_writes(spa_t *spa)
+{
+	if (spa->spa_root_vdev != NULL) {
+		vdev_initialize_stop_all(spa->spa_root_vdev,
+		    VDEV_INITIALIZE_ACTIVE);
+		vdev_trim_stop_all(spa->spa_root_vdev, VDEV_TRIM_ACTIVE);
+		vdev_autotrim_stop_all(spa);
+		vdev_rebuild_stop_all(spa);
+		l2arc_spa_rebuild_stop(spa);
+	}
+
+	if (spa->spa_final_txg == UINT64_MAX) {
+		spa_config_enter(spa, SCL_ALL, FTAG, RW_WRITER);
+		spa->spa_final_txg = spa_last_synced_txg(spa) +
+		    TXG_DEFER_SIZE + 1;
+		spa_config_exit(spa, SCL_ALL, FTAG);
+	}
+
+	if (spa->spa_sync_on) {
+		txg_sync_stop(spa->spa_dsl_pool);
+		spa->spa_sync_on = B_FALSE;
+	}
+
+	if (spa->spa_mmp.mmp_thread)
+		mmp_thread_stop(spa);
+
+	spa_destroy_aux_threads(spa);
+}
 
 /*
  * Opposite of spa_load().
@@ -2229,8 +2302,9 @@ spa_unload(spa_t *spa)
 
 	/*
 	 * If we have set the spa_final_txg, we have already performed the
-	 * tasks below in spa_export_common(). We should not redo it here since
-	 * we delay the final TXGs beyond what spa_final_txg is set at.
+	 * tasks below in spa_export_common() / spa_quiesce_writes(). We
+	 * should not redo them here since we delay the final TXGs beyond
+	 * what spa_final_txg is set at.
 	 */
 	if (spa->spa_final_txg == UINT64_MAX) {
 		if (spa_should_sync_time_logger_on_unload(spa))
@@ -2244,39 +2318,15 @@ spa_unload(spa_t *spa)
 		 */
 		if (spa_should_flush_logs_on_unload(spa))
 			spa_unload_log_sm_flush_all(spa);
-
-		/*
-		 * Stop async tasks.
-		 */
-		spa_async_suspend(spa);
-
-		if (spa->spa_root_vdev) {
-			vdev_t *root_vdev = spa->spa_root_vdev;
-			vdev_initialize_stop_all(root_vdev,
-			    VDEV_INITIALIZE_ACTIVE);
-			vdev_trim_stop_all(root_vdev, VDEV_TRIM_ACTIVE);
-			vdev_autotrim_stop_all(spa);
-			vdev_rebuild_stop_all(spa);
-			l2arc_spa_rebuild_stop(spa);
-		}
 	}
 
-	/*
-	 * Stop syncing.
-	 */
-	if (spa->spa_sync_on) {
-		txg_sync_stop(spa->spa_dsl_pool);
-		spa->spa_sync_on = B_FALSE;
-	}
+	spa_quiesce_writes(spa);
 
 	/*
 	 * This ensures that there is no async metaslab prefetching
 	 * while we attempt to unload the spa.
 	 */
 	taskq_wait(spa->spa_metaslab_taskq);
-
-	if (spa->spa_mmp.mmp_thread)
-		mmp_thread_stop(spa);
 
 	/*
 	 * Wait for any outstanding async I/O to complete.
@@ -2368,6 +2418,7 @@ spa_unload(spa_t *spa)
 	}
 
 	spa->spa_raidz_expand = NULL;
+	spa->spa_checkpoint_txg = 0;
 
 	spa_config_exit(spa, SCL_ALL, spa);
 }
@@ -2869,6 +2920,39 @@ spa_reset_logs(spa_t *spa)
 		txg_wait_synced(spa->spa_dsl_pool, 0);
 	}
 	return (error);
+}
+
+typedef struct spa_zil_cookie {
+	list_node_t	szc_node;
+	void		*szc_cookie;
+} spa_zil_cookie_t;
+
+/* used by spa_make_readonly() to flush the zils */
+static int
+spa_zil_suspend_cb(const char *osname, void *arg)
+{
+	list_t *cookies = arg;
+	void *cookie = NULL;
+	int error = zil_suspend(osname, &cookie);
+
+	if (cookie != NULL) {
+		spa_zil_cookie_t *szc = kmem_alloc(sizeof (*szc), KM_SLEEP);
+		szc->szc_cookie = cookie;
+		list_insert_tail(cookies, szc);
+	}
+
+	return (error);
+}
+
+static void
+spa_zil_resume_all(list_t *cookies)
+{
+	spa_zil_cookie_t *szc;
+
+	while ((szc = list_remove_head(cookies)) != NULL) {
+		zil_resume(szc->szc_cookie);
+		kmem_free(szc, sizeof (*szc));
+	}
 }
 
 static void
@@ -4692,7 +4776,7 @@ spa_ld_open_indirect_vdev_metadata(spa_t *spa)
 	/*
 	 * Retrieve information needed to condense indirect vdev mappings.
 	 */
-	error = spa_condense_init(spa);
+	error = spa_condense_init(spa, B_FALSE);
 	if (error != 0) {
 		spa_load_failed(spa, "spa_condense_init failed [error=%d]",
 		    error);
@@ -5522,6 +5606,127 @@ spa_ld_mos_with_trusted_config(spa_t *spa, spa_import_type_t type,
 	return (0);
 }
 
+static void
+spa_load_writeable(spa_t *spa, boolean_t checkpoint_rewind,
+    boolean_t update_config_cache, boolean_t have_locks)
+{
+	uint64_t config_cache_txg = spa->spa_config_txg;
+	spa_import_progress_set_notes(spa, "Starting import");
+	ASSERT(spa->spa_load_state != SPA_LOAD_TRYIMPORT);
+
+	/*
+	 * Before we do any zio_write's, complete the raidz expansion
+	 * scratch space copying, if necessary.
+	 */
+	if (RRSS_GET_STATE(&spa->spa_uberblock) == RRSS_SCRATCH_VALID)
+		vdev_raidz_reflow_copy_scratch(spa);
+
+	/*
+	 * In case of a checkpoint rewind, log the original txg
+	 * of the checkpointed uberblock.
+	 */
+	if (checkpoint_rewind) {
+		spa_history_log_internal(spa, "checkpoint rewind",
+		    NULL, "rewound state to txg=%llu",
+		    (u_longlong_t)spa->spa_uberblock.ub_checkpoint_txg);
+	}
+
+	spa_import_progress_set_notes(spa, "Claiming ZIL blocks");
+	/*
+	 * Traverse the ZIL and claim all blocks.
+	 */
+	spa_ld_claim_log_blocks(spa);
+
+	/*
+	 * Kick-off the syncing thread.
+	 */
+	spa->spa_sync_on = B_TRUE;
+	txg_sync_start(spa->spa_dsl_pool);
+	mmp_thread_start(spa);
+
+	/*
+	 * Wait for all claims to sync.  We sync up to the highest
+	 * claimed log block birth time so that claimed log blocks
+	 * don't appear to be from the future.  spa_claim_max_txg
+	 * will have been set for us by ZIL traversal operations
+	 * performed above.
+	 */
+	spa_import_progress_set_notes(spa, "Syncing ZIL claims");
+	txg_wait_synced(spa->spa_dsl_pool, spa->spa_claim_max_txg);
+
+	/*
+	 * Check if we need to request an update of the config. On the
+	 * next sync, we would update the config stored in vdev labels
+	 * and the cachefile (by default /etc/zfs/zpool.cache).
+	 */
+	spa_import_progress_set_notes(spa, "Updating configs");
+	spa_ld_check_for_config_update(spa, config_cache_txg,
+	    update_config_cache);
+
+	/*
+	 * Check if a rebuild was in progress and if so resume it.
+	 * Then check all DTLs to see if anything needs resilvering.
+	 * The resilver will be deferred if a rebuild was started.
+	 */
+	spa_import_progress_set_notes(spa, "Starting resilvers");
+	if (vdev_rebuild_active(spa->spa_root_vdev)) {
+		vdev_rebuild_restart(spa);
+	} else if (!dsl_scan_resilvering(spa->spa_dsl_pool) &&
+	    vdev_resilver_needed(spa->spa_root_vdev, NULL, NULL)) {
+		spa_async_request(spa, SPA_ASYNC_RESILVER);
+	}
+
+	/*
+	 * A scrub error log with no scan to own it is stale.
+	 * Promote it, so an error scrub can reach its entries.
+	 */
+	if (spa->spa_errlog_scrub != 0 && spa->spa_errlog_last == 0 &&
+	    !dsl_scan_scrubbing(spa->spa_dsl_pool) &&
+	    !dsl_scan_resilvering(spa->spa_dsl_pool) &&
+	    !dsl_errorscrubbing(spa->spa_dsl_pool))
+		spa_errlog_rotate(spa);
+
+	/*
+	 * Log the fact that we booted up (so that we can detect if
+	 * we rebooted in the middle of an operation).
+	 */
+	spa_history_log_version(spa, "open", NULL);
+
+	spa_import_progress_set_notes(spa, "Restarting device removals");
+	spa_restart_removal(spa);
+	spa_spawn_aux_threads(spa);
+
+	/*
+	 * Delete any inconsistent datasets.
+	 *
+	 * Note:
+	 * Since we may be issuing deletes for clones here,
+	 * we make sure to do so after we've spawned all the
+	 * auxiliary threads above (from which the livelist
+	 * deletion zthr is part of).
+	 */
+	spa_import_progress_set_notes(spa, "Cleaning up inconsistent objsets");
+	(void) dmu_objset_find(spa_name(spa), dsl_destroy_inconsistent, NULL,
+	    DS_FIND_CHILDREN);
+
+	/*
+	 * Clean up any stale temporary dataset userrefs.
+	 */
+	spa_import_progress_set_notes(spa, "Cleaning up temporary userrefs");
+	dsl_pool_clean_tmp_userrefs(spa->spa_dsl_pool);
+
+	if (!have_locks)
+		spa_config_enter(spa, SCL_CONFIG, FTAG, RW_READER);
+	spa_import_progress_set_notes(spa, "Restarting initialize");
+	vdev_initialize_restart(spa->spa_root_vdev);
+	spa_import_progress_set_notes(spa, "Restarting TRIM");
+	vdev_trim_restart(spa->spa_root_vdev);
+	vdev_autotrim_restart(spa);
+	if (!have_locks)
+		spa_config_exit(spa, SCL_CONFIG, FTAG);
+	spa_import_progress_set_notes(spa, "Finished importing");
+}
+
 /*
  * Load an existing storage pool, using the config provided. This config
  * describes which vdevs are part of the pool and is later validated against
@@ -5710,112 +5915,8 @@ spa_load_impl(spa_t *spa, spa_import_type_t type, const char **ereport)
 	spa_import_progress_set_notes(spa, "Starting import");
 	if (spa_writeable(spa) && (spa->spa_load_state == SPA_LOAD_RECOVER ||
 	    spa->spa_load_max_txg == UINT64_MAX)) {
-		uint64_t config_cache_txg = spa->spa_config_txg;
-
-		ASSERT(spa->spa_load_state != SPA_LOAD_TRYIMPORT);
-
-		/*
-		 * Before we do any zio_write's, complete the raidz expansion
-		 * scratch space copying, if necessary.
-		 */
-		if (RRSS_GET_STATE(&spa->spa_uberblock) == RRSS_SCRATCH_VALID)
-			vdev_raidz_reflow_copy_scratch(spa);
-
-		/*
-		 * In case of a checkpoint rewind, log the original txg
-		 * of the checkpointed uberblock.
-		 */
-		if (checkpoint_rewind) {
-			spa_history_log_internal(spa, "checkpoint rewind",
-			    NULL, "rewound state to txg=%llu",
-			    (u_longlong_t)spa->spa_uberblock.ub_checkpoint_txg);
-		}
-
-		spa_import_progress_set_notes(spa, "Claiming ZIL blocks");
-		/*
-		 * Traverse the ZIL and claim all blocks.
-		 */
-		spa_ld_claim_log_blocks(spa);
-
-		/*
-		 * Kick-off the syncing thread.
-		 */
-		spa->spa_sync_on = B_TRUE;
-		txg_sync_start(spa->spa_dsl_pool);
-		mmp_thread_start(spa);
-
-		/*
-		 * Wait for all claims to sync.  We sync up to the highest
-		 * claimed log block birth time so that claimed log blocks
-		 * don't appear to be from the future.  spa_claim_max_txg
-		 * will have been set for us by ZIL traversal operations
-		 * performed above.
-		 */
-		spa_import_progress_set_notes(spa, "Syncing ZIL claims");
-		txg_wait_synced(spa->spa_dsl_pool, spa->spa_claim_max_txg);
-
-		/*
-		 * Check if we need to request an update of the config. On the
-		 * next sync, we would update the config stored in vdev labels
-		 * and the cachefile (by default /etc/zfs/zpool.cache).
-		 */
-		spa_import_progress_set_notes(spa, "Updating configs");
-		spa_ld_check_for_config_update(spa, config_cache_txg,
-		    update_config_cache);
-
-		/*
-		 * Check if a rebuild was in progress and if so resume it.
-		 * Then check all DTLs to see if anything needs resilvering.
-		 * The resilver will be deferred if a rebuild was started.
-		 */
-		spa_import_progress_set_notes(spa, "Starting resilvers");
-		if (vdev_rebuild_active(spa->spa_root_vdev)) {
-			vdev_rebuild_restart(spa);
-		} else if (!dsl_scan_resilvering(spa->spa_dsl_pool) &&
-		    vdev_resilver_needed(spa->spa_root_vdev, NULL, NULL)) {
-			spa_async_request(spa, SPA_ASYNC_RESILVER);
-		}
-
-		/*
-		 * Log the fact that we booted up (so that we can detect if
-		 * we rebooted in the middle of an operation).
-		 */
-		spa_history_log_version(spa, "open", NULL);
-
-		spa_import_progress_set_notes(spa,
-		    "Restarting device removals");
-		spa_restart_removal(spa);
-		spa_spawn_aux_threads(spa);
-
-		/*
-		 * Delete any inconsistent datasets.
-		 *
-		 * Note:
-		 * Since we may be issuing deletes for clones here,
-		 * we make sure to do so after we've spawned all the
-		 * auxiliary threads above (from which the livelist
-		 * deletion zthr is part of).
-		 */
-		spa_import_progress_set_notes(spa,
-		    "Cleaning up inconsistent objsets");
-		(void) dmu_objset_find(spa_name(spa),
-		    dsl_destroy_inconsistent, NULL, DS_FIND_CHILDREN);
-
-		/*
-		 * Clean up any stale temporary dataset userrefs.
-		 */
-		spa_import_progress_set_notes(spa,
-		    "Cleaning up temporary userrefs");
-		dsl_pool_clean_tmp_userrefs(spa->spa_dsl_pool);
-
-		spa_config_enter(spa, SCL_CONFIG, FTAG, RW_READER);
-		spa_import_progress_set_notes(spa, "Restarting initialize");
-		vdev_initialize_restart(spa->spa_root_vdev);
-		spa_import_progress_set_notes(spa, "Restarting TRIM");
-		vdev_trim_restart(spa->spa_root_vdev);
-		vdev_autotrim_restart(spa);
-		spa_config_exit(spa, SCL_CONFIG, FTAG);
-		spa_import_progress_set_notes(spa, "Finished importing");
+		spa_load_writeable(spa, checkpoint_rewind, update_config_cache,
+		    B_FALSE);
 	}
 	zio_handle_import_delay(spa, gethrtime() - load_start);
 
@@ -6098,6 +6199,280 @@ int
 spa_open(const char *name, spa_t **spapp, const void *tag)
 {
 	return (spa_open_common(name, spapp, tag, NULL, NULL));
+}
+
+static void
+make_writeable_failed(spa_t *spa, const char *fmt, ...)
+{
+	va_list adx;
+	char buf[256];
+
+	va_start(adx, fmt);
+	(void) vsnprintf(buf, sizeof (buf), fmt, adx);
+	va_end(adx);
+
+	zfs_dbgmsg("spa_load(%s, config %s): FAILED: %s", spa->spa_name,
+	    spa->spa_trust_config ? "trusted" : "untrusted", buf);
+}
+
+/*
+ * Restart writing on a pool that was imported read-write and then switched
+ * to read-only with spa_make_readonly(). Spacemaps, log summaries, and
+ * metaslabs are already loaded; only the threads and device mode that
+ * spa_make_readonly() stopped need to be restarted.
+ */
+static int
+spa_resume_writeable(spa_t *spa)
+{
+	ASSERT3U(spa->spa_final_txg, !=, UINT64_MAX);
+	ASSERT0(spa->spa_sync_on);
+	ASSERT(!spa_writeable(spa));
+
+	spa_config_enter(spa, SCL_STATE_ALL, FTAG, RW_WRITER);
+	spa->spa_final_txg = UINT64_MAX;
+	spa->spa_mode |= SPA_MODE_WRITE;
+	vdev_reopen(spa->spa_root_vdev);
+	spa_config_exit(spa, SCL_STATE_ALL, FTAG);
+
+	spa_config_enter(spa, SCL_ALLOC | SCL_ZIO, FTAG, RW_WRITER);
+	spa_activate_log(spa);
+	spa_config_exit(spa, SCL_ALLOC | SCL_ZIO, FTAG);
+
+	spa->spa_sync_on = B_TRUE;
+	txg_sync_start(spa->spa_dsl_pool);
+	mmp_thread_start(spa);
+
+	if (vdev_rebuild_active(spa->spa_root_vdev)) {
+		vdev_rebuild_restart(spa);
+	} else if (!dsl_scan_resilvering(spa->spa_dsl_pool) &&
+	    vdev_resilver_needed(spa->spa_root_vdev, NULL, NULL)) {
+		spa_async_request(spa, SPA_ASYNC_RESILVER);
+	}
+
+	spa_config_enter(spa, SCL_CONFIG, FTAG, RW_READER);
+	vdev_initialize_restart(spa->spa_root_vdev);
+	vdev_trim_restart(spa->spa_root_vdev);
+	vdev_autotrim_restart(spa);
+	spa_config_exit(spa, SCL_CONFIG, FTAG);
+
+	spa_spawn_aux_threads(spa);
+	/* spa_make_readonly() left async tasks suspended on success. */
+	spa_async_resume(spa);
+
+	/*
+	 * Labels were synced as EXPORTED so another host could import.
+	 * Publish ACTIVE again before returning to the writer.
+	 */
+	mutex_enter(&spa_namespace_lock);
+	spa->spa_load_thread = NULL;
+	spa_config_update(spa, SPA_CONFIG_UPDATE_POOL);
+	cv_broadcast(&spa_namespace_cv);
+	mutex_exit(&spa_namespace_lock);
+
+	return (0);
+}
+
+/*
+ * Throw away the log summary built by a failed spa_ld_log_sm_data().
+ * A readonly import leaves spa_log_summary empty and keeps the log
+ * space map AVL, with sls_mscount already accounted. The failed
+ * writable load copies those counts into the summary. Drop the copy.
+ * Do not free the AVL or decrement sls_mscount: the pool stays imported.
+ */
+static void
+spa_discard_log_summary(spa_t *spa)
+{
+	log_summary_entry_t *e;
+
+	while ((e = list_remove_head(&spa->spa_log_summary)) != NULL)
+		kmem_free(e, sizeof (log_summary_entry_t));
+
+	spa->spa_unflushed_stats.sus_nblocks = 0;
+	spa->spa_unflushed_stats.sus_memused = 0;
+}
+
+static void
+rollback_partial_load(vdev_t *vd)
+{
+	for (int c = 0; c < vd->vdev_children; c++) {
+		vdev_t *cvd = vd->vdev_child[c];
+
+		rollback_partial_load(cvd);
+	}
+
+	/*
+	 * vdev_partial_load() opens metaslab space maps that a readonly
+	 * import left closed, then adds their allocated space and
+	 * histograms. spa_ld_log_sm_data() folds unflushed changes into
+	 * the same allocated-space total. Undo that and close the maps.
+	 * Leave sls_mscount alone; spa_ld_log_sm_metadata() set it at
+	 * import and the pool is still imported.
+	 */
+	if (vd == vd->vdev_top && vdev_is_concrete(vd)) {
+		for (uint64_t m = 0; m < vd->vdev_ms_count; m++) {
+			metaslab_t *msp = vd->vdev_ms[m];
+
+			if (msp->ms_sm == NULL)
+				continue;
+
+			metaslab_space_update(vd, msp->ms_group->mg_class,
+			    -(int64_t)msp->ms_allocated_space, 0, 0);
+			mutex_enter(&msp->ms_lock);
+			metaslab_group_histogram_remove(msp->ms_group, msp);
+			metaslab_unload(msp);
+			zfs_range_tree_vacate(msp->ms_unflushed_allocs, NULL,
+			    NULL);
+			zfs_range_tree_vacate(msp->ms_unflushed_frees, NULL,
+			    NULL);
+			mutex_exit(&msp->ms_lock);
+			metaslab_set_unflushed_dirty(msp, B_FALSE);
+			space_map_close(msp->ms_sm);
+			msp->ms_sm = NULL;
+			msp->ms_allocated_space = 0;
+			msp->ms_synced_length = 0;
+		}
+	}
+
+	if (vd->vdev_ops->vdev_op_leaf) {
+		space_map_close(vd->vdev_dtl_sm);
+		vd->vdev_dtl_sm = NULL;
+		for (int t = 0; t < DTL_TYPES; t++) {
+			zfs_range_tree_vacate(vd->vdev_dtl[t], NULL, NULL);
+		}
+	}
+}
+
+int
+spa_make_writeable(spa_t *spa)
+{
+	uberblock_t ub;
+	nvlist_t *label;
+	int error;
+	boolean_t config_held = B_FALSE;
+
+	vdev_uberblock_load(spa->spa_root_vdev, &ub, &label);
+	if (ub.ub_txg != spa->spa_uberblock.ub_txg) {
+		make_writeable_failed(spa, "newer uberblock detected: "
+		    "txg %llu (had %llu)", (u_longlong_t)ub.ub_txg,
+		    (u_longlong_t)spa->spa_uberblock.ub_txg);
+		nvlist_free(label);
+		mutex_enter(&spa_namespace_lock);
+		spa->spa_load_thread = NULL;
+		cv_broadcast(&spa_namespace_cv);
+		mutex_exit(&spa_namespace_lock);
+		return (SET_ERROR(EREMOTEIO));
+	}
+	nvlist_free(label);
+
+	/*
+	 * Imported read-write, then switched to read-only in this session.
+	 * spa_quiesce_writes() set spa_final_txg, whereas a read-only import
+	 * leaves it at UINT64_MAX and still needs the load path below.
+	 */
+	if (spa->spa_final_txg != UINT64_MAX)
+		return (spa_resume_writeable(spa));
+
+	boolean_t missing_feat_write = B_FALSE;
+	error = spa_ld_check_features(spa, &missing_feat_write);
+	if (error != 0) {
+		goto err;
+	}
+	if (missing_feat_write) {
+		error = SET_ERROR(EROFS);
+		goto err;
+	}
+
+	/*
+	 * Retrieve information needed to condense indirect vdev mappings.
+	 */
+	error = spa_condense_init(spa, B_TRUE);
+	if (error != 0) {
+		make_writeable_failed(spa, "spa_condense_init failed "
+		    "[error=%d]", error);
+		goto err;
+	}
+
+	/*
+	 * Retrieve the list of auxiliary devices - cache devices and spares -
+	 * and open them.
+	 */
+	error = spa_ld_open_aux_vdevs(spa, SPA_IMPORT_EXISTING);
+	if (error != 0)
+		goto err;
+
+	spa_config_enter(spa, SCL_STATE_ALL, spa, RW_READER);
+	config_held = B_TRUE;
+	spa->spa_mode |= SPA_MODE_WRITE;
+	error = vdev_partial_load(spa->spa_root_vdev);
+	if (error != 0)
+		goto err;
+
+	error = spa_ld_log_sm_data(spa);
+	if (error != 0)
+		goto err;
+
+	const char *ereport;
+	error = spa_ld_verify_logs(spa, SPA_IMPORT_EXISTING, &ereport);
+	if (error != 0)
+		goto err;
+
+	mutex_enter(&spa_namespace_lock);
+	spa_config_exit(spa, SCL_STATE_ALL, spa);
+	spa_config_enter(spa, SCL_STATE_ALL, spa, RW_WRITER);
+	mutex_exit(&spa_namespace_lock);
+
+	spa_import_progress_add(spa);
+	vdev_reopen(spa->spa_root_vdev);
+
+	mutex_enter(&spa_namespace_lock);
+	spa_config_exit(spa, SCL_STATE_ALL, spa);
+	spa_config_enter(spa, SCL_STATE_ALL | SCL_CONFIG, spa, RW_READER);
+	mutex_exit(&spa_namespace_lock);
+	spa_load_writeable(spa, B_FALSE, B_FALSE, B_TRUE);
+
+	/*
+	 * Update the config cache to include the newly-imported pool.
+	 */
+	mutex_enter(&spa_namespace_lock);
+	spa_config_exit(spa, SCL_STATE_ALL | SCL_CONFIG, spa);
+	spa->spa_load_thread = NULL;
+	spa_config_update(spa, SPA_CONFIG_UPDATE_POOL);
+	cv_broadcast(&spa_namespace_cv);
+	mutex_exit(&spa_namespace_lock);
+	spa_import_progress_remove(spa_guid(spa));
+
+	return (0);
+
+err:
+	/*
+	 * The pool stays imported. spa_ld_log_sm_data() copies
+	 * sls_mscount into a new log summary. spa_unload_log_sm_metadata()
+	 * would VERIFY0(lse_mscount) on that summary and then free the
+	 * log AVL the readonly pool still uses. Spares and cache were
+	 * reloaded onto this spa; freeing them drops devices the
+	 * imported pool still has.
+	 */
+	spa->spa_load_state = SPA_LOAD_ERROR;
+	for (spa_log_sm_t *sls = avl_first(&spa->spa_sm_logs_by_txg);
+	    sls; sls = AVL_NEXT(&spa->spa_sm_logs_by_txg, sls)) {
+		if (sls->sls_sm != NULL) {
+			space_map_close(sls->sls_sm);
+			sls->sls_sm = NULL;
+		}
+		sls->sls_nblocks = 0;
+	}
+	rollback_partial_load(spa->spa_root_vdev);
+	spa_discard_log_summary(spa);
+	spa->spa_mode &= ~SPA_MODE_WRITE;
+	spa_condense_fini(spa);
+	mutex_enter(&spa_namespace_lock);
+	if (config_held)
+		spa_config_exit(spa, SCL_STATE_ALL, spa);
+	spa->spa_load_thread = NULL;
+	cv_broadcast(&spa_namespace_cv);
+	mutex_exit(&spa_namespace_lock);
+	spa->spa_load_state = SPA_LOAD_NONE;
+	return (error);
 }
 
 /*
@@ -7291,7 +7666,7 @@ spa_export_common(const char *pool, int new_state, nvlist_t **oldconfig,
 		}
 
 		/*
-		 * We're about to export or destroy this pool. Make sure
+		 * We're about to export or destroy the pool. Make sure
 		 * we stop all initialization and trim activity here before
 		 * we set the spa_final_txg. This will ensure that all
 		 * dirty data resulting from the initialization is
@@ -7305,8 +7680,8 @@ spa_export_common(const char *pool, int new_state, nvlist_t **oldconfig,
 
 		/*
 		 * We want this to be reflected on every label,
-		 * so mark them all dirty.  spa_unload() will do the
-		 * final sync that pushes these changes out.
+		 * so mark them all dirty.  spa_quiesce_writes() will
+		 * sync these changes out.
 		 */
 		if (new_state != POOL_STATE_UNINITIALIZED && !hardforce) {
 			spa_config_enter(spa, SCL_ALL, FTAG, RW_WRITER);
@@ -7331,12 +7706,8 @@ spa_export_common(const char *pool, int new_state, nvlist_t **oldconfig,
 		if (spa_should_flush_logs_on_unload(spa))
 			spa_unload_log_sm_flush_all(spa);
 
-		if (new_state != POOL_STATE_UNINITIALIZED && !hardforce) {
-			spa_config_enter(spa, SCL_ALL, FTAG, RW_WRITER);
-			spa->spa_final_txg = spa_last_synced_txg(spa) +
-			    TXG_DEFER_SIZE + 1;
-			spa_config_exit(spa, SCL_ALL, FTAG);
-		}
+		if (new_state != POOL_STATE_UNINITIALIZED && !hardforce)
+			spa_quiesce_writes(spa);
 	}
 
 export_spa:
@@ -7426,6 +7797,218 @@ spa_reset(const char *pool)
 {
 	return (spa_export_common(pool, POOL_STATE_UNINITIALIZED, NULL,
 	    B_FALSE, B_FALSE));
+}
+
+/*
+ * Fail if a filesystem is mounted writable, or a zvol is open writable.
+ * Unmounted datasets and closed zvols are ignored.
+ */
+#ifdef	_KERNEL
+static int
+spa_mounted_writable_cb(const char *osname, void *arg)
+{
+	(void) arg;
+	zfsvfs_t *zfsvfs;
+	zvol_state_t *zv;
+
+	/* it's a filesystem */
+	if (getzfsvfs(osname, &zfsvfs) == 0) {
+		if (!zfs_is_readonly(zfsvfs)) {
+			zfs_vfs_rele(zfsvfs);
+			return (SET_ERROR(EBUSY));
+		}
+		zfs_vfs_rele(zfsvfs);
+		return (0);
+	}
+
+	/* it's a zvol */
+	zv = zvol_find_by_name_hash(osname, zvol_name_hash(osname), RW_NONE);
+	if (zv == NULL)
+		return (0);
+
+	if (zv->zv_open_count > 0 && !(zv->zv_flags & ZVOL_RDONLY)) {
+		mutex_exit(&zv->zv_state_lock);
+		return (SET_ERROR(EBUSY));
+	}
+
+	mutex_exit(&zv->zv_state_lock);
+	return (0);
+}
+#endif	/* _KERNEL */
+
+/*
+ * Check if we're blocked from converting a pool from rw to ro.
+ *
+ * Unless skip_mounts is set, also fail if any filesystem is mounted
+ * writable or a zvol is open writable. (We only skip_mounts if
+ * we're holding the namespace lock.)
+ */
+static boolean_t
+spa_make_readonly_blocked(spa_t *spa, boolean_t skip_mounts)
+{
+	if (spa_suspended(spa))
+		return (B_TRUE);
+
+	if (spa->spa_vdev_removal != NULL ||
+	    spa->spa_removing_phys.sr_state == DSS_SCANNING)
+		return (B_TRUE);
+
+	if (spa->spa_condensing_indirect != NULL ||
+	    spa->spa_condensing_indirect_phys.scip_next_mapping_object != 0)
+		return (B_TRUE);
+
+	if (spa_checkpoint_discard_thread_check(spa, NULL))
+		return (B_TRUE);
+
+	if (spa->spa_raidz_expand != NULL)
+		return (B_TRUE);
+
+#ifdef	_KERNEL
+	if (!skip_mounts && dmu_objset_find(spa_name(spa),
+	    spa_mounted_writable_cb, NULL, DS_FIND_CHILDREN) != 0)
+		return (B_TRUE);
+#else
+	(void) skip_mounts;
+	if (spa_simulate_writable_mounts > 0 &&
+	    --spa_simulate_writable_mounts == 0)
+		return (B_TRUE);
+#endif
+
+	return (B_FALSE);
+}
+
+/*
+ * Make a pool RO from a RW state. From the CLI, this is done by executing
+ * `zpool set readonly=on`. In this proof-of-concept, all we do is check
+ * that all filesystems are readonly (`zfs mount -o remount,ro`) first,
+ * and that zvols are not being written to. A real implementation of this
+ * would extend the code to call the necessary kernel functions to make
+ * the datasets RO after draining all write activity. That's beyond the
+ * scope of this PoC.
+ */
+int
+spa_make_readonly(spa_t *spa)
+{
+	boolean_t activate_slog = B_FALSE;
+	boolean_t cookies_created = B_FALSE;
+	list_t zil_cookies;
+	int error = 0;
+
+	/* nothing to do? */
+	if (!spa_writeable(spa))
+		return (0);
+
+	/* failfast: validate spa state */
+	if (spa_make_readonly_blocked(spa, B_FALSE))
+		return (SET_ERROR(EBUSY));
+
+	/* pretend we're exporting the pool */
+	mutex_enter(&spa_namespace_lock);
+	if (spa->spa_is_exporting) {
+		mutex_exit(&spa_namespace_lock);
+		return (SET_ERROR(ZFS_ERR_EXPORT_IN_PROGRESS));
+	}
+
+	/* validate spa state again, inside the namespace lock this time */
+	if (spa_make_readonly_blocked(spa, B_TRUE)) {
+		mutex_exit(&spa_namespace_lock);
+		return (SET_ERROR(EBUSY));
+	}
+	spa->spa_is_exporting = B_TRUE;
+	spa->spa_export_thread = curthread;
+	mutex_exit(&spa_namespace_lock);
+
+	spa_async_suspend(spa);
+
+	/* check that we're still in a good state */
+	if (spa_make_readonly_blocked(spa, B_FALSE)) {
+		error = SET_ERROR(EBUSY);
+		goto out;
+	}
+
+	list_create(&zil_cookies, sizeof (spa_zil_cookie_t),
+	    offsetof(spa_zil_cookie_t, szc_node));
+	cookies_created = B_TRUE;
+
+	spa_config_enter(spa, SCL_ALLOC | SCL_ZIO, FTAG, RW_WRITER);
+	activate_slog = spa_passivate_log(spa);
+	spa_config_exit(spa, SCL_ALLOC | SCL_ZIO, FTAG);
+
+	/*
+	 * Commit, sync, and destroy every dataset ZIL.  Keep them
+	 * suspended so a concurrent fsync cannot allocate a new chain.
+	 */
+	if ((error = dmu_objset_find(spa_name(spa), spa_zil_suspend_cb,
+	    &zil_cookies, DS_FIND_CHILDREN)) == 0) {
+		txg_wait_synced(spa->spa_dsl_pool, 0);
+		/* after syncing, we should still be good to go */
+		if (spa_make_readonly_blocked(spa, B_FALSE))
+			error = SET_ERROR(EBUSY);
+	}
+
+	if (error == 0) {
+		/*
+		 * Here's where we write the EXPORTED state to the labels
+		 * so that another pool can import RO as well. Note that
+		 * there's nothing in this PoC that stops someone from
+		 * importing the pool RW, which would cause this pool to
+		 * eventually panic. A more robust implementation is needed
+		 * (probably leveraging off of mmp?) to support that.
+		 */
+		spa_config_enter(spa, SCL_ALL, FTAG, RW_WRITER);
+		spa->spa_state = POOL_STATE_EXPORTED;
+		vdev_config_dirty(spa->spa_root_vdev);
+		spa_config_exit(spa, SCL_ALL, FTAG);
+
+		if (spa_should_sync_time_logger_on_unload(spa))
+			spa_unload_sync_time_logger(spa);
+		if (spa_should_flush_logs_on_unload(spa))
+			spa_unload_log_sm_flush_all(spa);
+
+		for (spa_zil_cookie_t *szc = list_head(&zil_cookies); szc;
+		    szc = list_next(&zil_cookies, szc))
+			zil_reset_txg_info(dmu_objset_zil(szc->szc_cookie));
+
+		spa_quiesce_writes(spa);
+		spa_config_enter(spa, SCL_STATE, FTAG, RW_READER);
+		error = vdev_uberblock_sync_list(spa->spa_root_vdev->vdev_child,
+		    spa->spa_root_vdev->vdev_children, &spa->spa_uberblock,
+		    ZIO_FLAG_CONFIG_WRITER);
+		spa_config_exit(spa, SCL_STATE, FTAG);
+
+		/* tag the spa active (internal only) so we can keep reading */
+		spa_config_enter(spa, SCL_ALL, FTAG, RW_WRITER);
+		spa->spa_state = POOL_STATE_ACTIVE;
+		spa_config_exit(spa, SCL_ALL, FTAG);
+
+		spa_config_enter(spa, SCL_STATE_ALL, FTAG, RW_WRITER);
+		spa->spa_mode = SPA_MODE_READ;
+		vdev_reopen(spa->spa_root_vdev);
+		spa_config_exit(spa, SCL_STATE_ALL, FTAG);
+	} else if (activate_slog) {
+		spa_config_enter(spa, SCL_ALLOC | SCL_ZIO, FTAG, RW_WRITER);
+		spa_activate_log(spa);
+		spa_config_exit(spa, SCL_ALLOC | SCL_ZIO, FTAG);
+	}
+
+	if (cookies_created) {
+		spa_zil_resume_all(&zil_cookies);
+		list_destroy(&zil_cookies);
+	}
+
+out:
+	if (error != 0)
+		spa_async_resume(spa);
+
+	spa_evicting_os_wait(spa);
+
+	mutex_enter(&spa_namespace_lock);
+	spa->spa_is_exporting = B_FALSE;
+	spa->spa_export_thread = NULL;
+	cv_broadcast(&spa_namespace_cv);
+	mutex_exit(&spa_namespace_lock);
+
+	return (error);
 }
 
 /*
@@ -11109,6 +11692,7 @@ EXPORT_SYMBOL(spa_tryimport);
 EXPORT_SYMBOL(spa_destroy);
 EXPORT_SYMBOL(spa_export);
 EXPORT_SYMBOL(spa_reset);
+EXPORT_SYMBOL(spa_make_readonly);
 EXPORT_SYMBOL(spa_async_request);
 EXPORT_SYMBOL(spa_async_suspend);
 EXPORT_SYMBOL(spa_async_resume);

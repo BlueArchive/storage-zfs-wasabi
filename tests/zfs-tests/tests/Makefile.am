@@ -1253,6 +1253,33 @@ nobase_dist_datadir_zfs_tests_tests_SCRIPTS += \
 	functional/cli_root/zpool_set/user_property_002_neg.ksh \
 	functional/cli_root/zpool_set/zpool_set_features.ksh \
 	functional/cli_root/zpool_set/zpool_set_clear_userprop.ksh \
+	functional/cli_root/zpool_set/zpool_set_readonly_001_pos.ksh \
+	functional/cli_root/zpool_set/zpool_set_readonly_002_pos.ksh \
+	functional/cli_root/zpool_set/zpool_set_readonly_003_pos.ksh \
+	functional/cli_root/zpool_set/zpool_set_readonly_004_pos.ksh \
+	functional/cli_root/zpool_set/zpool_set_readonly_005_pos.ksh \
+	functional/cli_root/zpool_set/zpool_set_readonly_006_pos.ksh \
+	functional/cli_root/zpool_set/zpool_set_readonly_007_pos.ksh \
+	functional/cli_root/zpool_set/zpool_set_readonly_008_pos.ksh \
+	functional/cli_root/zpool_set/zpool_set_readonly_009_pos.ksh \
+	functional/cli_root/zpool_set/zpool_set_readonly_010_pos.ksh \
+	functional/cli_root/zpool_set/zpool_set_readonly_011_pos.ksh \
+	functional/cli_root/zpool_set/zpool_set_readonly_012_pos.ksh \
+	functional/cli_root/zpool_set/zpool_set_readonly_013_pos.ksh \
+	functional/cli_root/zpool_set/zpool_set_readonly_014_pos.ksh \
+	functional/cli_root/zpool_set/zpool_set_readonly_015_pos.ksh \
+	functional/cli_root/zpool_set/zpool_set_readonly_016_pos.ksh \
+	functional/cli_root/zpool_set/zpool_set_readonly_017_pos.ksh \
+	functional/cli_root/zpool_set/zpool_set_readonly_018_pos.ksh \
+	functional/cli_root/zpool_set/zpool_set_readonly_019_pos.ksh \
+	functional/cli_root/zpool_set/zpool_set_readonly_001_neg.ksh \
+	functional/cli_root/zpool_set/zpool_set_readonly_002_neg.ksh \
+	functional/cli_root/zpool_set/zpool_set_readonly_003_neg.ksh \
+	functional/cli_root/zpool_set/zpool_set_readonly_004_neg.ksh \
+	functional/cli_root/zpool_set/zpool_set_readonly_005_neg.ksh \
+	functional/cli_root/zpool_set/zpool_set_readonly_006_neg.ksh \
+	functional/cli_root/zpool_set/zpool_set_readonly_007_neg.ksh \
+	functional/cli_root/zpool_set/zpool_set_readonly_008_neg.ksh \
 	functional/cli_root/zpool_split/cleanup.ksh \
 	functional/cli_root/zpool_split/setup.ksh \
 	functional/cli_root/zpool_split/zpool_split_cliargs.ksh \

@@ -757,6 +757,7 @@ extern int spa_checkpoint_discard(const char *pool);
 extern int spa_export(const char *pool, nvlist_t **oldconfig, boolean_t force,
     boolean_t hardforce);
 extern int spa_reset(const char *pool);
+extern int spa_make_readonly(spa_t *spa);
 extern void spa_async_request(spa_t *spa, int flag);
 extern void spa_async_unrequest(spa_t *spa, int flag);
 extern void spa_async_suspend(spa_t *spa);
@@ -768,6 +769,7 @@ extern void spa_scan_stat_init(spa_t *spa);
 extern int spa_scan_get_stats(spa_t *spa, pool_scan_stat_t *ps);
 extern int bpobj_enqueue_alloc_cb(void *arg, const blkptr_t *bp, dmu_tx_t *tx);
 extern int bpobj_enqueue_free_cb(void *arg, const blkptr_t *bp, dmu_tx_t *tx);
+extern int spa_make_writeable(spa_t *spa);
 
 #define	SPA_ASYNC_CONFIG_UPDATE			0x01
 #define	SPA_ASYNC_REMOVE			0x02

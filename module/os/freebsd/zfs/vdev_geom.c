@@ -81,6 +81,13 @@ static int vdev_geom_bio_delete_disable;
 SYSCTL_INT(_vfs_zfs_vdev, OID_AUTO, bio_delete_disable, CTLFLAG_RWTUN,
 	&vdev_geom_bio_delete_disable, 0, "Disable BIO_DELETE");
 
+typedef struct vdev_geom {
+	spa_mode_t vg_open_mode;
+	struct g_consumer *vg_consumer;
+} vdev_geom_t;
+
+#define	GEOM_GET_CP(vd) (((vdev_geom_t *)(vd->vdev_tsd))->vg_consumer)
+
 /* Declare local functions */
 static void vdev_geom_detach(struct g_consumer *cp, boolean_t open_for_read);
 
@@ -208,6 +215,19 @@ vdev_geom_orphan(struct g_consumer *cp)
 	}
 }
 
+static void
+vdev_geom_set_cp(vdev_t *vd, struct g_consumer *cp)
+{
+	vdev_geom_t *vg;
+
+	if (vd->vdev_tsd != NULL)
+		kmem_free(vd->vdev_tsd, sizeof (vdev_geom_t));
+	vg = kmem_alloc(sizeof (vdev_geom_t), KM_SLEEP);
+	vg->vg_consumer = cp;
+	vg->vg_open_mode = spa_mode(vd->vdev_spa);
+	vd->vdev_tsd  = vg;
+}
+
 static struct g_consumer *
 vdev_geom_attach(struct g_provider *pp, vdev_t *vd, boolean_t sanity)
 {
@@ -299,7 +319,7 @@ vdev_geom_attach(struct g_provider *pp, vdev_t *vd, boolean_t sanity)
 	}
 
 	if (vd != NULL)
-		vd->vdev_tsd = cp;
+		vdev_geom_set_cp(vd, cp);
 
 	cp->flags |= G_CF_DIRECT_SEND | G_CF_DIRECT_RECEIVE;
 	return (cp);
@@ -336,6 +356,41 @@ vdev_geom_detach(struct g_consumer *cp, boolean_t open_for_read)
 	}
 }
 
+/*
+ * Set device mode based on the current spa mode.
+ */
+static int
+vdev_geom_set_mode(vdev_t *vd, struct g_consumer *cp)
+{
+	spa_mode_t spamode = spa_mode(vd->vdev_spa);
+
+	g_topology_assert();
+
+	if ((spamode & SPA_MODE_WRITE) != 0) {
+		int error = 0;
+
+		if (cp->acw > 0)
+			return (0);
+
+		for (int i = 0; i < 5; i++) {
+			error = g_access(cp, 0, 1, 0);
+			if (error == 0)
+				return (0);
+			g_topology_unlock();
+			tsleep(vd, 0, "vdev", hz / 2);
+			g_topology_lock();
+		}
+		printf("ZFS WARNING: Unable to open %s for writing "
+		    "(error=%d).\n", cp->provider->name, error);
+		return (error);
+	}
+
+	if (cp->acw > 0)
+		g_access(cp, 0, -cp->acw, 0);
+
+	return (0);
+}
+
 static void
 vdev_geom_close_locked(vdev_t *vd)
 {
@@ -345,14 +400,15 @@ vdev_geom_close_locked(vdev_t *vd)
 
 	g_topology_assert();
 
-	cp = vd->vdev_tsd;
 	vd->vdev_delayed_close = B_FALSE;
-	if (cp == NULL)
+	if (vd->vdev_tsd == NULL)
 		return;
+	cp = GEOM_GET_CP(vd);
 
 	ZFS_LOG(1, "Closing access to %s.", cp->provider->name);
 	KASSERT(cp->private != NULL, ("%s: cp->private is NULL", __func__));
 	priv = (struct consumer_priv_t *)&cp->private;
+	kmem_free(vd->vdev_tsd, sizeof (vdev_geom_t));
 	vd->vdev_tsd = NULL;
 	SLIST_FOREACH_SAFE(elem, priv, elems, elem_temp) {
 		if (elem->vd == vd) {
@@ -828,8 +884,9 @@ vdev_geom_open(vdev_t *vd, uint64_t *psize, uint64_t *max_psize,
 	 * Reopen the device if it's not currently open. Otherwise,
 	 * just update the physical size of the device.
 	 */
-	if ((cp = vd->vdev_tsd) != NULL) {
+	if (vd->vdev_tsd != NULL) {
 		ASSERT(vd->vdev_reopening);
+		cp = GEOM_GET_CP(vd);
 		goto skip_open;
 	}
 
@@ -882,7 +939,7 @@ vdev_geom_open(vdev_t *vd, uint64_t *psize, uint64_t *max_psize,
 	} else {
 		struct consumer_priv_t *priv;
 		struct consumer_vdev_elem *elem;
-		int spamode;
+		spa_mode_t spamode = spa_mode(vd->vdev_spa);
 
 		priv = (struct consumer_priv_t *)&cp->private;
 		if (cp->private == NULL)
@@ -891,7 +948,6 @@ vdev_geom_open(vdev_t *vd, uint64_t *psize, uint64_t *max_psize,
 		elem->vd = vd;
 		SLIST_INSERT_HEAD(priv, elem, elems);
 
-		spamode = spa_mode(vd->vdev_spa);
 		if (cp->provider->sectorsize > VDEV_PAD_SIZE ||
 		    !ISP2(cp->provider->sectorsize)) {
 			ZFS_LOG(1, "Provider %s has unsupported sectorsize.",
@@ -982,17 +1038,20 @@ skip_open:
 static void
 vdev_geom_close(vdev_t *vd)
 {
-	struct g_consumer *cp;
+	struct g_consumer *cp = NULL;
+	vdev_geom_t *vg = vd->vdev_tsd;
 	boolean_t locked;
+	spa_mode_t spa_open_mode = spa_mode(vd->vdev_spa);
 
-	cp = vd->vdev_tsd;
+	if (vd->vdev_tsd != NULL)
+		cp = GEOM_GET_CP(vd);
 
 	DROP_GIANT();
 	locked = g_topology_locked();
 	if (!locked)
 		g_topology_lock();
 
-	if (!vd->vdev_reopening ||
+	if (!(vd->vdev_reopening && vg->vg_open_mode == spa_open_mode) ||
 	    (cp != NULL && ((cp->flags & G_CF_ORPHAN) != 0 ||
 	    (cp->provider != NULL && cp->provider->error != 0))))
 		vdev_geom_close_locked(vd);
@@ -1165,12 +1224,12 @@ vdev_geom_io_start(zio_t *zio)
 	    zio->io_type == ZIO_TYPE_TRIM ||
 	    zio->io_type == ZIO_TYPE_FLUSH);
 
-	cp = vd->vdev_tsd;
-	if (cp == NULL) {
+	if (vd->vdev_tsd == NULL) {
 		zio->io_error = SET_ERROR(ENXIO);
 		zio_interrupt(zio);
 		return;
 	}
+	cp = GEOM_GET_CP(vd);
 	bp = g_alloc_bio();
 	bp->bio_caller1 = zio;
 	switch (zio->io_type) {
