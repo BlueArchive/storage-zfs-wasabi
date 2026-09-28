@@ -72,6 +72,7 @@ typedef void zfs_bdev_handle_t;
 #endif
 
 typedef struct vdev_disk {
+	spa_mode_t			vd_open_mode;
 	zfs_bdev_handle_t		*vd_bdh;
 	krwlock_t			vd_lock;
 } vdev_disk_t;
@@ -337,8 +338,8 @@ vdev_disk_open(vdev_t *v, uint64_t *psize, uint64_t *max_psize,
 			}
 
 			vdev_blkdev_put(bdh,
-			    v->vdev_open_mode != SPA_MODE_UNINIT ?
-			    v->vdev_open_mode : smode, zfs_vdev_holder);
+			    vd->vd_open_mode != SPA_MODE_UNINIT ?
+			    vd->vd_open_mode : smode, zfs_vdev_holder);
 		}
 
 		if (reread_part) {
@@ -357,6 +358,7 @@ vdev_disk_open(vdev_t *v, uint64_t *psize, uint64_t *max_psize,
 	} else {
 		vd = kmem_zalloc(sizeof (vdev_disk_t), KM_SLEEP);
 
+		vd->vd_open_mode = smode;
 		rw_init(&vd->vd_lock, NULL, RW_DEFAULT, NULL);
 		rw_enter(&vd->vd_lock, RW_WRITER);
 	}
@@ -469,13 +471,14 @@ static void
 vdev_disk_close(vdev_t *v)
 {
 	vdev_disk_t *vd = v->vdev_tsd;
+	spa_mode_t open_mode = spa_mode(v->vdev_spa);
 
-	if (v->vdev_reopening || vd == NULL)
+	if (vd == NULL || (v->vdev_reopening && vd->vd_open_mode == open_mode))
 		return;
 
 	if (vd->vd_bdh != NULL) {
-		spa_mode_t put_mode = v->vdev_open_mode != SPA_MODE_UNINIT ?
-		    v->vdev_open_mode : spa_mode(v->vdev_spa);
+		spa_mode_t put_mode = vd->vd_open_mode != SPA_MODE_UNINIT ?
+		    vd->vd_open_mode : open_mode;
 		vdev_blkdev_put(vd->vd_bdh, put_mode, zfs_vdev_holder);
 	}
 
