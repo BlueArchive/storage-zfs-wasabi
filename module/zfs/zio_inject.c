@@ -173,6 +173,40 @@ done:
 }
 
 /*
+ * Inject a one-time error into the middle of a function.
+ */
+int
+zio_handle_func_injection(spa_t *spa, const char *tag, int *error)
+{
+	inject_handler_t *handler;
+	int ret = 0;
+
+	rw_enter(&inject_lock, RW_READER);
+
+	for (handler = list_head(&inject_handlers); handler != NULL;
+	    handler = list_next(&inject_handlers, handler)) {
+		/* wrong pool? */
+		if (spa != handler->zi_spa)
+			continue;
+
+		/* make sure we haven't triggered this error already */
+		if (handler->zi_record.zi_cmd != ZINJECT_FUNC_FAULT ||
+		    handler->zi_record.zi_inject_count != 0 ||
+		    strcmp(tag, handler->zi_record.zi_func) != 0)
+			continue;
+
+		handler->zi_record.zi_match_count++;
+		handler->zi_record.zi_inject_count++;
+		*error = handler->zi_record.zi_error;
+		ret = 1;
+		break;
+	}
+
+	rw_exit(&inject_lock);
+	return (ret);
+}
+
+/*
  * Panic the system when a config change happens in the function
  * specified by tag.
  */

@@ -3013,6 +3013,8 @@ spa_load_verify_done(zio_t *zio)
 static uint_t spa_load_verify_shift = 4;
 static int spa_load_verify_metadata = B_TRUE;
 static int spa_load_verify_data = B_TRUE;
+static int spa_delay_resilver_done = B_FALSE;
+static int spa_fail_partial_load = B_FALSE;
 
 static int
 spa_load_verify_cb(spa_t *spa, zilog_t *zilog, const blkptr_t *bp,
@@ -6351,7 +6353,9 @@ spa_make_writeable(spa_t *spa)
 	boolean_t config_held = B_FALSE;
 
 	vdev_uberblock_load(spa->spa_root_vdev, &ub, &label);
-	if (ub.ub_txg != spa->spa_uberblock.ub_txg) {
+	if (ub.ub_txg != spa->spa_uberblock.ub_txg ||
+	    (zio_injection_enabled &&
+	    zio_handle_func_injection(spa, "mrw:newer-uberblock", &error))) {
 		make_writeable_failed(spa, "newer uberblock detected: "
 		    "txg %llu (had %llu)", (u_longlong_t)ub.ub_txg,
 		    (u_longlong_t)spa->spa_uberblock.ub_txg);
@@ -6374,6 +6378,10 @@ spa_make_writeable(spa_t *spa)
 
 	boolean_t missing_feat_write = B_FALSE;
 	error = spa_ld_check_features(spa, &missing_feat_write);
+	if (error == 0 && zio_injection_enabled &&
+	    zio_handle_func_injection(spa, "mrw:missing-feat-write", &error))
+		missing_feat_write = B_TRUE;
+
 	if (error != 0) {
 		goto err;
 	}
@@ -6386,6 +6394,8 @@ spa_make_writeable(spa_t *spa)
 	 * Retrieve information needed to condense indirect vdev mappings.
 	 */
 	error = spa_condense_init(spa, B_TRUE);
+	if (error == 0 && zio_injection_enabled)
+		zio_handle_func_injection(spa, "mrw:condense", &error);
 	if (error != 0) {
 		make_writeable_failed(spa, "spa_condense_init failed "
 		    "[error=%d]", error);
@@ -6397,6 +6407,8 @@ spa_make_writeable(spa_t *spa)
 	 * and open them.
 	 */
 	error = spa_ld_open_aux_vdevs(spa, SPA_IMPORT_EXISTING);
+	if (error == 0 && zio_injection_enabled)
+		zio_handle_func_injection(spa, "mrw:aux-vdevs", &error);
 	if (error != 0)
 		goto err;
 
@@ -6404,15 +6416,23 @@ spa_make_writeable(spa_t *spa)
 	config_held = B_TRUE;
 	spa->spa_mode |= SPA_MODE_WRITE;
 	error = vdev_partial_load(spa->spa_root_vdev);
+	if (error == 0 && zio_injection_enabled)
+		zio_handle_func_injection(spa, "mrw:partial-load", &error);
+	if (spa_fail_partial_load)
+		error = EIO;
 	if (error != 0)
 		goto err;
 
 	error = spa_ld_log_sm_data(spa);
+	if (error == 0 && zio_injection_enabled)
+		zio_handle_func_injection(spa, "mrw:log-spacemap", &error);
 	if (error != 0)
 		goto err;
 
 	const char *ereport;
 	error = spa_ld_verify_logs(spa, SPA_IMPORT_EXISTING, &ereport);
+	if (error == 0 && zio_injection_enabled)
+		zio_handle_func_injection(spa, "mrw:log-verify", &error);
 	if (error != 0)
 		goto err;
 
@@ -9757,6 +9777,7 @@ spa_async_thread(void *arg)
 	spa_t *spa = (spa_t *)arg;
 	dsl_pool_t *dp = spa->spa_dsl_pool;
 	int tasks;
+	int do_resilver_cleanup;
 
 	ASSERT(spa->spa_sync_on);
 
@@ -9764,6 +9785,11 @@ spa_async_thread(void *arg)
 	tasks = spa->spa_async_tasks;
 	spa->spa_async_tasks = 0;
 	mutex_exit(&spa->spa_async_lock);
+
+	do_resilver_cleanup =
+	    (tasks & SPA_ASYNC_RESILVER_DONE ||
+	    tasks & SPA_ASYNC_REBUILD_DONE ||
+	    tasks & SPA_ASYNC_DETACH_SPARE);
 
 	/*
 	 * See if the config needs to be updated.
@@ -9838,10 +9864,17 @@ spa_async_thread(void *arg)
 	/*
 	 * If any devices are done replacing, detach them.
 	 */
-	if (tasks & SPA_ASYNC_RESILVER_DONE ||
-	    tasks & SPA_ASYNC_REBUILD_DONE ||
-	    tasks & SPA_ASYNC_DETACH_SPARE) {
+	if (do_resilver_cleanup) {
+#ifdef ZFS_DEBUG
+		if (spa_delay_resilver_done) {
+			/* try again in the next pass */
+			spa_async_request(spa, SPA_ASYNC_RESILVER_DONE);
+		} else {
+			spa_vdev_resilver_done(spa);
+		}
+#else
 		spa_vdev_resilver_done(spa);
+#endif
 	}
 
 	/*
@@ -11805,3 +11838,8 @@ ZFS_MODULE_VIRTUAL_PARAM_CALL(zfs_zio, zio_, taskq_write,
 
 ZFS_MODULE_PARAM(zfs_zio, zio_, taskq_write_tpq, UINT, ZMOD_RW,
 	"Number of CPUs per write issue taskq");
+
+#ifdef ZFS_DEBUG
+ZFS_MODULE_PARAM(zfs_spa, spa_, delay_resilver_done, INT, ZMOD_RW,
+	"Set to hold off on automatic replace removal");
+#endif
